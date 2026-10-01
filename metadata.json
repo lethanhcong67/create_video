@@ -1,0 +1,6 @@
+{
+  "name": "AI Image Character & Outfit Swapper",
+  "description": "Batch edit images to replace characters, swap outfits with uploaded references, remove subtitles/captions, and generate polished visuals.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
