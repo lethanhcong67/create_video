@@ -1,7 +1,7 @@
 /**
- * Utility to extract keyframes from video and analyze motion prompts in Vietnamese
- * Calling Gemini 3.7 Flash directly via OpenLux AI:
- * https://api.openlux.ai/v1beta/models/gemini-3.7-flash:generateContent
+ * Utility to extract keyframes from video and analyze motion prompts in Vietnamese.
+ * The actual Gemini call happens server-side (POST /api/video/analyze-motion-prompts)
+ * so the AI provider API key never has to be shipped to the browser bundle.
  */
 
 import { ExtractedVideoFrame } from './videoExtractor';
@@ -20,9 +20,6 @@ export interface VideoPromptAnalysisResult {
   engine?: string;
   error?: string;
 }
-
-const OPENLUX_GEMINI_ENDPOINT = 'https://api.openlux.ai/v1beta/models/gemini-3.7-flash:generateContent';
-const DEFAULT_OPENLUX_KEY = 'sk-***REVOKED-ROTATE-ME***';
 
 /**
  * Extract evenly spaced keyframe data URLs from a video file
@@ -125,8 +122,9 @@ function seekVideo(video: HTMLVideoElement, time: number): Promise<void> {
 }
 
 /**
- * Directly call OpenLux Gemini 3.7 Flash endpoint
- * https://api.openlux.ai/v1beta/models/gemini-3.7-flash:generateContent
+ * Analyze video keyframes into Vietnamese motion prompts via the server proxy endpoint.
+ * The server resolves the Gemini/OpenLux API key from its own environment (or the caller's
+ * saved config, if provided) — the browser never holds a real provider key for this feature.
  */
 export async function analyzeVideoPrompts(
   params: VideoPromptAnalysisParams
@@ -155,8 +153,10 @@ export async function analyzeVideoPrompts(
     throw new Error('Không thể trích xuất khung hình từ video để phân tích.');
   }
 
-  const targetUrl = (baseUrl && baseUrl.trim()) || OPENLUX_GEMINI_ENDPOINT;
+  // Optionally forward the user's own saved key/endpoint (from Settings); otherwise
+  // the server falls back to its own VISION_API_KEY / GEMINI_API_KEY.
   let effectiveKey = (apiKey && apiKey.trim()) || '';
+  let visionConfig: { baseUrl?: string } | undefined = baseUrl ? { baseUrl } : undefined;
 
   if (!effectiveKey) {
     try {
@@ -168,158 +168,37 @@ export async function analyzeVideoPrompts(
           parsed?.gemini?.apiKey ||
           parsed?.gptImage?.apiKey ||
           '';
+        if (!visionConfig && parsed?.vision?.baseUrl) {
+          visionConfig = { baseUrl: parsed.vision.baseUrl };
+        }
       }
     } catch (_) { }
   }
 
-  if (!effectiveKey) {
-    effectiveKey = DEFAULT_OPENLUX_KEY;
-  }
-
-  const inlineParts = framesToAnalyze.map((frame: string) => {
-    let base64 = frame;
-    let mimeType = 'image/jpeg';
-    if (typeof frame === 'string' && frame.startsWith('data:')) {
-      const match = frame.match(/^data:([^;]+);base64,(.+)$/);
-      if (match) {
-        mimeType = match[1] || 'image/jpeg';
-        base64 = match[2];
-      } else {
-        const commaIdx = frame.indexOf(',');
-        if (commaIdx !== -1) {
-          base64 = frame.slice(commaIdx + 1);
-        }
-      }
-    }
-    return {
-      inlineData: {
-        mimeType,
-        data: base64,
-      },
-    };
-  });
-
-  const systemPrompt = `Bạn là một đạo diễn hình ảnh và chuyên gia phân tích video AI hàng đầu thế giới.
-Dưới đây là chuỗi các khung hình (keyframes) được trích xuất theo trình tự thời gian từ một video mẫu.
-Hãy quan sát và phân tích kỹ sự diễn biến, bối cảnh, sự thay đổi hành động/tư thế của nhân vật và chuyển động của góc máy camera (pan, tilt, zoom, dolly, tracking, handheld...) qua từng phân cảnh hoặc nhịp chuyển động chính.
-
-Nhiệm vụ của bạn: Tạo ra một danh sách các câu Prompt video chi tiết hoàn toàn bằng TIẾNG VIỆT, mượt mà, sống động, sẵn sàng sử dụng cho các công cụ AI tạo video. Mỗi câu prompt là một phân cảnh hoặc một nhịp chuyển động chính, mô tả cụ thể hành động của nhân vật kết hợp góc máy camera.
-
-QUY TẮC BẮT BUỘC:
-1. Viết 100% bằng TIẾNG VIỆT tự nhiên, sống động, giàu chi tiết chuyển động nhân vật và góc quay.
-2. KHÔNG ghi số thứ tự cảnh (ví dụ: TUYỆT ĐỐI KHÔNG ghi "Cảnh 1", "Cảnh 2", "1.", "2.", "Scene 1").
-3. KHÔNG ghi mốc thời gian hay thời lượng (ví dụ: KHÔNG ghi "00:00 - 00:03", "(3 giây)").
-4. Chỉ trả về DUY NHẤT một mảng JSON các chuỗi prompt tiếng Việt theo định dạng:
-[
-  "Câu prompt chuyển động tiếng Việt thứ nhất...",
-  "Câu prompt chuyển động tiếng Việt thứ hai...",
-  "Câu prompt chuyển động tiếng Việt thứ ba..."
-]
-Tuyệt đối không kèm bất kỳ giải thích, tiêu đề, hoặc văn bản nào ngoài mảng JSON này.`;
-
-  const requestBody = {
-    contents: [
-      {
-        role: 'user',
-        parts: [
-          ...inlineParts,
-          {
-            text: systemPrompt,
-          },
-        ],
-      },
-    ],
-    generationConfig: {
-      temperature: 0.3,
-    },
-  };
-
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'x-goog-api-key': effectiveKey,
-    Authorization: `Bearer ${effectiveKey}`,
-  };
-
-  const response = await fetch(targetUrl, {
+  const response = await fetch('/api/video/analyze-motion-prompts', {
     method: 'POST',
-    headers,
-    body: JSON.stringify(requestBody),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      frames: framesToAnalyze,
+      customKey: effectiveKey || undefined,
+      visionConfig,
+      model: 'gemini-3.7-flash',
+    }),
   });
 
-  const resText = await response.text();
-  let resJson: any = null;
-  try {
-    resJson = resText ? JSON.parse(resText) : null;
-  } catch (_) { }
+  const data = await response.json().catch(() => ({}));
 
-  if (!response.ok) {
-    const errMsg =
-      resJson?.error?.message ||
-      resJson?.message ||
-      `Lỗi HTTP ${response.status} từ Gemini 3.7 Flash (${resText.slice(0, 150)})`;
-    throw new Error(errMsg);
+  if (!response.ok || !data.success) {
+    throw new Error(data?.error || `Lỗi khi phân tích prompt video (HTTP ${response.status}).`);
   }
 
-  const textOutput = resJson?.candidates?.[0]?.content?.parts
-    ?.map((p: any) => p.text || '')
-    .join('')
-    .trim();
-
-  if (!textOutput) {
-    throw new Error('Không nhận được nội dung phân tích từ Gemini 3.7 Flash.');
-  }
-
-  let prompts: string[] = [];
-  const cleanText = textOutput
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/i, '')
-    .replace(/```$/i, '')
-    .trim();
-
-  try {
-    const parsed = JSON.parse(cleanText);
-    if (Array.isArray(parsed)) {
-      prompts = parsed.map((item: any) =>
-        typeof item === 'string' ? item : item.prompt || JSON.stringify(item)
-      );
-    }
-  } catch (_) {
-    const matchArray = cleanText.match(/\[[\s\S]*\]/);
-    if (matchArray) {
-      try {
-        const parsed = JSON.parse(matchArray[0]);
-        if (Array.isArray(parsed)) {
-          prompts = parsed.map((item: any) =>
-            typeof item === 'string' ? item : item.prompt || JSON.stringify(item)
-          );
-        }
-      } catch (e2) { }
-    }
-  }
-
-  if (prompts.length === 0) {
-    prompts = cleanText
-      .split(/\n+/)
-      .map((l) => l.trim())
-      .filter((l) => l.length > 5 && !l.startsWith('[') && !l.startsWith(']'));
-  }
-
-  const cleanedPrompts = prompts
-    .map((p) => {
-      return p
-        .replace(/^["'\s]+|["'\s]+$/g, '')
-        .replace(/^(\d+[\.\:\)\-]|cảnh\s*\d+[\.\:\)\-]?|scene\s*\d+[\.\:\)\-]?)\s*/i, '')
-        .trim();
-    })
-    .filter((p) => p.length > 0);
-
-  if (cleanedPrompts.length === 0) {
+  if (!Array.isArray(data.prompts) || data.prompts.length === 0) {
     throw new Error('Không thể tạo được danh sách prompt từ video. Vui lòng thử lại.');
   }
 
   return {
     success: true,
-    prompts: cleanedPrompts,
-    engine: 'Gemini 3.5 Flash (OpenLux AI)',
+    prompts: data.prompts,
+    engine: data.engine || 'Gemini 3.7 Flash',
   };
 }

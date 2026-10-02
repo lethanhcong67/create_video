@@ -674,6 +674,28 @@ QUY TẮC BẮT BUỘC VỀ NHỊP ĐIỆU & ĐỘ BẢO TOÀN SẢN PHẨM:
 9. ĐỦ ĐÚNG 5 PHÂN CẢNH (scenes có đúng 5 phần tử từ 1 đến 5), mỗi cảnh đúng 5 giây.
 `;
 
+      // Shared JSON output structure (identical across both prompt branches below) so future
+      // rule changes (e.g. anti-180-flip wording) only need to be edited in one place.
+      const sceneJsonStructureTemplate = (productNamePlaceholder: string) => `  "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm",
+  "adConcept": "Ý tưởng kịch bản thị giác viral nhịp nhanh, cuốn hút cho sản phẩm này",
+  "scriptTitle": "Tiêu đề video quảng cáo viral",
+  "scenes": [
+    {
+      "sceneNumber": 1,
+      "sceneType": "Hero Hook - Thu hút ánh nhìn",
+      "selectedImageIndex": 0,
+      "refImageReason": "Ảnh 1 chụp chính diện rõ nét toàn bộ hình in và kiểu dáng, tối ưu cho cảnh Hook mở đầu",
+      "title": "Cảnh 1: Tiêu đề mô tả cảnh phù hợp với sản phẩm",
+      "visualDescription": "Mô tả khung hình thị giác dọc 9:16 chân thực...",
+      "productFocus": "Đặc tả chi tiết sản phẩm trong cảnh này...",
+      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ${productNamePlaceholder}, soft diffused warm indoor lamp light, no smoke no steam, no glare no lens flare, shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, no waxy AI look, crisp legible typography from reference image, photorealistic 8k",
+      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of ${productNamePlaceholder}, standalone product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing onto front printed artwork, front graphic directly facing camera with strictly no 180-degree flip, snappy lively momentum, normal 1.0x speed, rigid solid geometry, 100% stable printed artwork, 4k",
+      "cameraMotion": "zoom_in",
+      "duration": "5"
+    }
+  ]
+}`;
+
       let prompt = "";
       if (productSpecs && productSpecs.productName) {
         prompt = `
@@ -716,25 +738,7 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
     "keyFeatures": "${productSpecs.keyFeatures || ""}",
     "promptSnippet": "${productSpecs.promptSnippet || ""}"
   },
-  "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm",
-  "adConcept": "Ý tưởng kịch bản thị giác viral nhịp nhanh, cuốn hút cho sản phẩm này",
-  "scriptTitle": "Tiêu đề video quảng cáo viral",
-  "scenes": [
-    {
-      "sceneNumber": 1,
-      "sceneType": "Hero Hook - Thu hút ánh nhìn",
-      "selectedImageIndex": 0,
-      "refImageReason": "Ảnh 1 chụp chính diện rõ nét toàn bộ hình in và kiểu dáng, tối ưu cho cảnh Hook mở đầu",
-      "title": "Cảnh 1: Tiêu đề mô tả cảnh phù hợp với sản phẩm",
-      "visualDescription": "Mô tả khung hình thị giác dọc 9:16 chân thực...",
-      "productFocus": "Đặc tả chi tiết sản phẩm trong cảnh này...",
-      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ... soft diffused warm indoor lamp light, no smoke no steam, no glare no lens flare, shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, no waxy AI look, crisp legible typography from reference image, photorealistic 8k",
-      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of [${productSpecs.productName}], standalone product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing onto front printed artwork, front graphic directly facing camera with strictly no 180-degree flip, snappy lively momentum, normal 1.0x speed, rigid solid geometry, 100% stable printed artwork, 4k",
-      "cameraMotion": "zoom_in",
-      "duration": "5"
-    }
-  ]
-}
+${sceneJsonStructureTemplate(`[${productSpecs.productName}]`)}
 `;
       } else {
         prompt = `
@@ -766,25 +770,7 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
     "keyFeatures": "Điểm nhấn nổi bật",
     "promptSnippet": "English physical specs snippet"
   },
-  "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm",
-  "adConcept": "Ý tưởng kịch bản thị giác viral nhịp nhanh, cuốn hút cho sản phẩm này",
-  "scriptTitle": "Tiêu đề video quảng cáo viral",
-  "scenes": [
-    {
-      "sceneNumber": 1,
-      "sceneType": "Hero Hook - Thu hút ánh nhìn",
-      "selectedImageIndex": 0,
-      "refImageReason": "Ảnh 1 chụp chính diện rõ nét toàn bộ hình in và kiểu dáng",
-      "title": "Cảnh 1: Tiêu đề cảnh",
-      "visualDescription": "Mô tả khung hình thị giác dọc 9:16 chân thực...",
-      "productFocus": "Góc máy đặc tả sản phẩm...",
-      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ... soft diffused warm indoor lamp lighting, no smoke no steam, no glare no lens flare, shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, crisp typography, photorealistic 8k",
-      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of ..., standalone product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing onto front printed artwork, front graphic directly facing camera with strictly no 180-degree flip, snappy lively momentum, normal 1.0x speed, rigid solid geometry, 100% stable printed artwork, 4k",
-      "cameraMotion": "zoom_in",
-      "duration": "5"
-    }
-  ]
-}
+${sceneJsonStructureTemplate("...")}
 `;
       }
 
@@ -802,6 +788,13 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
         } else {
           throw new Error("Không thể phân tích phản hồi kịch bản dạng JSON từ Gemini");
         }
+      }
+
+      // Enforce the "exactly 5 scenes" contract the prompt demands — fail loudly instead of
+      // silently shipping a script with the wrong scene count downstream.
+      if (!parsedScript || !Array.isArray(parsedScript.scenes) || parsedScript.scenes.length !== 5) {
+        const got = parsedScript && Array.isArray(parsedScript.scenes) ? parsedScript.scenes.length : 0;
+        throw new Error(`AI trả về ${got} phân cảnh thay vì đúng 5 phân cảnh yêu cầu. Vui lòng thử lại.`);
       }
 
       // Map AI selected reference images directly to corresponding URLs
@@ -918,7 +911,7 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
       let generatedDataUrl = "";
 
       if (useOpenLux) {
-        const keyToUse = effectiveGeminiKey.startsWith("sk-") ? effectiveGeminiKey : (effectiveGptKey || "sk-***REVOKED-ROTATE-ME***");
+        const keyToUse = effectiveGeminiKey.startsWith("sk-") ? effectiveGeminiKey : (effectiveGptKey || process.env.OPENLUX_API_KEY || "");
         const rawBuf = Buffer.from(base64Data, "base64");
         
         let pngBuf: Buffer;
@@ -1217,7 +1210,7 @@ Specific scene layout and action: ${prompt}`;
     }
   });
 
-  const DEFAULT_VISION_KEY = process.env.VISION_API_KEY || process.env.GEMINI_API_KEY || "sk-***REVOKED-ROTATE-ME***";
+  const DEFAULT_VISION_KEY = process.env.VISION_API_KEY || process.env.GEMINI_API_KEY || "";
   const DEFAULT_VISION_URL = process.env.VISION_API_URL || "https://api.openlux.ai/v1beta/models/gemini-3.7-flash:generateContent";
   const DEFAULT_VISION_MODEL = "gemini-3.5-flash";
 
@@ -2312,6 +2305,105 @@ Hãy trả về DUY NHẤT một mảng JSON gồm chính xác ${count} phần t
     }
   }
 
+  // Extract motion/camera-movement prompts (Vietnamese) from a sequence of sample-video keyframes.
+  // Runs server-side so the Gemini/OpenLux API key never has to be shipped to the browser.
+  app.post("/api/video/analyze-motion-prompts", async (req, res) => {
+    try {
+      const { frames = [], customKey, visionConfig, model = "gemini-3.7-flash" } = req.body;
+
+      if (!Array.isArray(frames) || frames.length === 0) {
+        return res.status(400).json({ error: "Thiếu danh sách khung hình (frames) để phân tích." });
+      }
+
+      const apiKey = (customKey && customKey.trim()) || DEFAULT_VISION_KEY;
+      if (!apiKey) {
+        return res.status(400).json({ error: "Thiếu Gemini API Key để phân tích prompt chuyển động video." });
+      }
+
+      const imageParts = await prepareAllProductImageParts(frames, 10);
+      if (imageParts.length === 0) {
+        return res.status(400).json({ error: "Không thể xử lý khung hình để phân tích." });
+      }
+
+      const systemPrompt = `Bạn là một đạo diễn hình ảnh và chuyên gia phân tích video AI hàng đầu thế giới.
+Dưới đây là chuỗi các khung hình (keyframes) được trích xuất theo trình tự thời gian từ một video mẫu.
+Hãy quan sát và phân tích kỹ sự diễn biến, bối cảnh, sự thay đổi hành động/tư thế của nhân vật và chuyển động của góc máy camera (pan, tilt, zoom, dolly, tracking, handheld...) qua từng phân cảnh hoặc nhịp chuyển động chính.
+
+Nhiệm vụ của bạn: Tạo ra một danh sách các câu Prompt video chi tiết hoàn toàn bằng TIẾNG VIỆT, mượt mà, sống động, sẵn sàng sử dụng cho các công cụ AI tạo video. Mỗi câu prompt là một phân cảnh hoặc một nhịp chuyển động chính, mô tả cụ thể hành động của nhân vật kết hợp góc máy camera.
+
+QUY TẮC BẮT BUỘC:
+1. Viết 100% bằng TIẾNG VIỆT tự nhiên, sống động, giàu chi tiết chuyển động nhân vật và góc quay.
+2. KHÔNG ghi số thứ tự cảnh (ví dụ: TUYỆT ĐỐI KHÔNG ghi "Cảnh 1", "Cảnh 2", "1.", "2.", "Scene 1").
+3. KHÔNG ghi mốc thời gian hay thời lượng (ví dụ: KHÔNG ghi "00:00 - 00:03", "(3 giây)").
+4. Chỉ trả về DUY NHẤT một mảng JSON các chuỗi prompt tiếng Việt theo định dạng:
+[
+  "Câu prompt chuyển động tiếng Việt thứ nhất...",
+  "Câu prompt chuyển động tiếng Việt thứ hai...",
+  "Câu prompt chuyển động tiếng Việt thứ ba..."
+]
+Tuyệt đối không kèm bất kỳ giải thích, tiêu đề, hoặc văn bản nào ngoài mảng JSON này.`;
+
+      const responseText = await callGeminiVisionText(apiKey, systemPrompt, imageParts, visionConfig, model);
+
+      if (!responseText || !responseText.trim()) {
+        return res.status(502).json({ error: "Không nhận được nội dung phân tích từ Gemini." });
+      }
+
+      let prompts: string[] = [];
+      const cleanText = responseText
+        .replace(/^```json\s*/i, "")
+        .replace(/^```\s*/i, "")
+        .replace(/```$/i, "")
+        .trim();
+
+      try {
+        const parsed = JSON.parse(cleanText);
+        if (Array.isArray(parsed)) {
+          prompts = parsed.map((item: any) => (typeof item === "string" ? item : item.prompt || JSON.stringify(item)));
+        }
+      } catch {
+        const jsonMatch = cleanText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          try {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (Array.isArray(parsed)) {
+              prompts = parsed.map((item: any) => (typeof item === "string" ? item : item.prompt || JSON.stringify(item)));
+            }
+          } catch {}
+        }
+      }
+
+      if (prompts.length === 0) {
+        prompts = cleanText
+          .split(/\n+/)
+          .map((l) => l.trim())
+          .filter((l) => l.length > 5 && !l.startsWith("[") && !l.startsWith("]"));
+      }
+
+      const cleanedPrompts = prompts
+        .map((p) =>
+          p
+            .replace(/^["'\s]+|["'\s]+$/g, "")
+            .replace(/^(\d+[\.\:\)\-]|cảnh\s*\d+[\.\:\)\-]?|scene\s*\d+[\.\:\)\-]?)\s*/i, "")
+            .trim()
+        )
+        .filter((p) => p.length > 0);
+
+      if (cleanedPrompts.length === 0) {
+        return res.status(502).json({ error: "Không thể tạo được danh sách prompt từ video. Vui lòng thử lại." });
+      }
+
+      return res.json({
+        success: true,
+        prompts: cleanedPrompts,
+        engine: `${model} (Server Proxy)`,
+      });
+    } catch (err: any) {
+      console.error("❌ [Video Motion Prompt Analyzer Error]:", err);
+      return res.status(500).json({ error: err?.message || "Lỗi khi phân tích prompt chuyển động video." });
+    }
+  });
+
   // AI Quality & Realism Inspector / Evaluator for Generated Scene Videos (Scale 1.0 - 10.0)
   app.post("/api/video/evaluate-and-refine", async (req, res) => {
     try {
@@ -2443,12 +2535,15 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo định dạng:
       });
     } catch (err: any) {
       console.error("❌ [Evaluate & Refine Video Error]:", err);
+      // IMPORTANT: Do NOT silently auto-pass when the inspector itself fails — that defeats
+      // the purpose of the QC gate (a broken video would ship unreviewed). Report it as not
+      // passed so the existing retry flow (max 2 retries) kicks in instead.
       return res.status(200).json({
-        success: true,
-        score: 8.0,
-        passed: true,
-        summary: "Tự động duyệt video (Dự phòng lỗi kiểm định)",
-        issues: [],
+        success: false,
+        score: 0,
+        passed: false,
+        summary: "Không thể thẩm định video do lỗi hệ thống (" + (err?.message || "unknown") + "). Vui lòng kiểm tra lại.",
+        issues: ["evaluation_error"],
         refinedPrompt: req.body.currentPrompt,
       });
     }
@@ -3325,8 +3420,8 @@ ${outfitPrompt ? `User notes: "${outfitPrompt}"` : ""}`,
         const endpointKeys = gptImageConfig?.endpointKeys || {};
         const openLuxUrl = "https://api.openlux.ai/v1/images/edits";
         const mnApiUrl = "https://www.mnapi.com/v1/images/edits";
-        const defaultOpenLuxKey = "sk-***REVOKED-ROTATE-ME***";
-        const defaultMnApiKey = "sk-***REVOKED-ROTATE-ME***";
+        const defaultOpenLuxKey = process.env.OPENLUX_API_KEY || "";
+        const defaultMnApiKey = process.env.MNAPI_API_KEY || "";
 
         // Retrieve OpenLux key (always 1st candidate)
         const openLuxKey =

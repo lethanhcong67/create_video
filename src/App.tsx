@@ -17,7 +17,7 @@ import {
 const API_STORAGE_KEY = 'create_video_api_config_v1';
 
 const DEFAULT_GPT_CONFIG: GptImageConfig = {
-  apiKey: 'sk-***REVOKED-ROTATE-ME***',
+  apiKey: '',
   baseUrl: 'https://api.openlux.ai/v1/images/edits',
   model: 'gpt-image-2',
   size: '1152x2048',
@@ -25,12 +25,12 @@ const DEFAULT_GPT_CONFIG: GptImageConfig = {
   isCustomKeyActive: true,
   isValidated: true,
   endpointKeys: {
-    'https://api.openlux.ai/v1/images/edits': 'sk-***REVOKED-ROTATE-ME***',
+    'https://api.openlux.ai/v1/images/edits': '',
   },
 };
 
 const DEFAULT_KLING_CONFIG: KlingVideoConfig = {
-  apiKey: 'sk-***REVOKED-ROTATE-ME***',
+  apiKey: '',
   baseUrl: 'https://api.openlux.ai/kling/v1/videos/image2video',
   model: 'kling-v2-6',
   mode: 'pro',
@@ -45,7 +45,7 @@ const DEFAULT_KLING_CONFIG: KlingVideoConfig = {
 };
 
 const DEFAULT_VISION_CONFIG: VisionAnalysisConfig = {
-  apiKey: 'sk-***REVOKED-ROTATE-ME***',
+  apiKey: '',
   provider: 'gemini',
   model: 'gemini-3.5-flash',
   baseUrl: 'https://api.openlux.ai/v1beta/models/gemini-3.7-flash:generateContent',
@@ -60,7 +60,7 @@ function loadSavedApiConfig(): ApiConfig {
       const parsed = JSON.parse(saved);
       return {
         activeProvider: parsed.activeProvider || 'kling',
-        apiKey: parsed.apiKey || 'sk-***REVOKED-ROTATE-ME***',
+        apiKey: parsed.apiKey || '',
         model: parsed.model || 'gemini-3.1-flash-image',
         isCustomKeyActive: Boolean(parsed.isCustomKeyActive ?? true),
         isValidated: Boolean(parsed.isValidated ?? true),
@@ -77,7 +77,7 @@ function loadSavedApiConfig(): ApiConfig {
   }
   return {
     activeProvider: 'kling',
-    apiKey: 'sk-***REVOKED-ROTATE-ME***',
+    apiKey: '',
     model: 'gemini-3.1-flash-image',
     isCustomKeyActive: true,
     isValidated: true,
@@ -480,7 +480,8 @@ export default function App() {
               }
             } catch (evalErr: any) {
               console.warn("Lỗi kiểm định video:", evalErr);
-              // Fallback to completed
+              // Do not claim the video passed QC when the inspector call itself threw —
+              // mark it honestly as unverified so the user knows to double-check this scene.
               setVideoItems((prev) =>
                 prev.map((item) =>
                   item.id === targetItem.id
@@ -490,9 +491,9 @@ export default function App() {
                         progress: 100,
                         resultVideoUrl: videoUrl,
                         completedAt: Date.now(),
-                        evaluationStatus: 'passed',
-                        evaluationScore: 8.0,
-                        evaluationSummary: 'Đã hoàn thành',
+                        evaluationStatus: 'failed',
+                        evaluationScore: 0,
+                        evaluationSummary: 'Không thể thẩm định (lỗi kết nối) — vui lòng kiểm tra thủ công',
                       }
                     : item
                 )

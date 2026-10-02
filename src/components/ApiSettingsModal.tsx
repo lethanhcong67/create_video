@@ -142,8 +142,8 @@ export const AVAILABLE_VISION_MODELS: ImageModelOption[] = [
 ];
 
 export const DEFAULT_GPT_ENDPOINT_KEYS: Record<string, string> = {
-  'https://api.openlux.ai/v1/images/edits': 'sk-***REVOKED-ROTATE-ME***',
-  'https://www.mnapi.com/v1/images/edits': 'sk-***REVOKED-ROTATE-ME***',
+  'https://api.openlux.ai/v1/images/edits': '',
+  'https://www.mnapi.com/v1/images/edits': '',
   'https://api.openai.com/v1': '',
 };
 
@@ -177,7 +177,7 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
   const [activeProvider, setActiveProvider] = useState<ApiProviderType>(config.activeProvider || 'gemini');
 
   // Gemini state
-  const [geminiKey, setGeminiKey] = useState(config.apiKey || 'sk-***REVOKED-ROTATE-ME***');
+  const [geminiKey, setGeminiKey] = useState(config.apiKey || '');
   const [geminiBaseUrl, setGeminiBaseUrl] = useState(
     config.visionAnalysis?.baseUrl || 'https://api.openlux.ai/v1beta/models/gemini-3.7-flash:generateContent'
   );
@@ -186,7 +186,7 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
   const [showGeminiKey, setShowGeminiKey] = useState(false);
 
   // Vision Analysis Key state (Separate Key specifically for image analysis)
-  const [visionKey, setVisionKey] = useState(config.visionAnalysis?.apiKey || 'sk-***REVOKED-ROTATE-ME***');
+  const [visionKey, setVisionKey] = useState(config.visionAnalysis?.apiKey || '');
   const [visionProvider, setVisionProvider] = useState<'gemini' | 'openai' | 'openlux'>(
     config.visionAnalysis?.provider || 'gemini'
   );
@@ -214,7 +214,7 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
     config.gptImage?.baseUrl || 'https://api.openlux.ai/v1/images/edits'
   );
   const [gptKey, setGptKey] = useState(
-    config.gptImage?.apiKey || DEFAULT_GPT_ENDPOINT_KEYS['https://api.openlux.ai/v1/images/edits']
+    config.gptImage?.apiKey || DEFAULT_GPT_ENDPOINT_KEYS['https://api.openlux.ai/v1/images/edits'] || ''
   );
   const [selectedGptModel, setSelectedGptModel] = useState(config.gptImage?.model || 'gpt-image-2');
   const [gptSize, setGptSize] = useState<string>(config.gptImage?.size || '1152x2048');
@@ -224,7 +224,7 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
   const [showGptKey, setShowGptKey] = useState(false);
 
   // Kling Video state
-  const [klingKey, setKlingKey] = useState(config.kling?.apiKey || 'sk-***REVOKED-ROTATE-ME***');
+  const [klingKey, setKlingKey] = useState(config.kling?.apiKey || '');
   const [klingAccessKey, setKlingAccessKey] = useState(config.kling?.accessKey || '');
   const [klingSecretKey, setKlingSecretKey] = useState(config.kling?.secretKey || '');
   const [klingBaseUrl, setKlingBaseUrl] = useState(
@@ -280,7 +280,7 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
         setActiveTab(initialTab);
       }
       setActiveProvider(config.activeProvider || 'gemini');
-      setGeminiKey(config.apiKey || 'sk-***REVOKED-ROTATE-ME***');
+      setGeminiKey(config.apiKey || '');
       setGeminiBaseUrl(config.visionAnalysis?.baseUrl || 'https://api.openlux.ai/v1beta/models/gemini-3.7-flash:generateContent');
       setSelectedGeminiModel(config.model || 'gemini-3.1-flash-image');
       setUseCustomGeminiKey(config.isCustomKeyActive);
@@ -635,7 +635,7 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
     };
 
     const updatedVisionConfig = {
-      apiKey: geminiKey.trim() || visionKey.trim() || 'sk-***REVOKED-ROTATE-ME***',
+      apiKey: geminiKey.trim() || visionKey.trim() || '',
       provider: visionProvider || 'gemini',
       model: selectedGeminiModel || visionModel || 'gemini-3.5-flash',
       baseUrl: geminiBaseUrl.trim() || visionBaseUrl.trim() || 'https://api.openlux.ai/v1beta/models/gemini-3.7-flash:generateContent',
