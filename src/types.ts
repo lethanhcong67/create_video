@@ -45,6 +45,8 @@ export interface VideoGenerationItem {
   resultVideoUrl?: string;
   resultVideoPath?: string;
   error?: string;
+  batchId?: string;
+  sceneIndex?: number;
   createdAt: number;
   completedAt?: number;
 }

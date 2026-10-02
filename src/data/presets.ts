@@ -117,3 +117,55 @@ export const VIDEO_PROMPT_IDEAS = [
     type: 'text_to_video'
   }
 ];
+
+export const POD_SCENE_ARCHETYPES = [
+  {
+    id: 'ugc_show_design',
+    name: 'Cảnh UGC Show Design (Direct Product UGC)',
+    icon: '📱',
+    badge: 'UGC Cầm Tay',
+    description: 'Cận cảnh cầm tay 60-70% tiền cảnh, khóa nét tuyệt đối, nhân vật sau mờ nhẹ, ánh sáng tự nhiên.',
+    color: 'from-blue-600/20 to-cyan-600/20 border-cyan-500/40 text-cyan-300',
+  },
+  {
+    id: 'gift_unboxing',
+    name: 'Cảnh Hộp Quà & Đóng Gói (Gift Packaging & Unboxing)',
+    icon: '🎁',
+    badge: 'Mở Hộp Quà',
+    description: 'Góc POV 45°/Flatlay, tay mở nắp dứt khoát hoặc nhấc sản phẩm từ khay lót, kích thích insight quà tặng.',
+    color: 'from-amber-600/20 to-rose-600/20 border-amber-500/40 text-amber-300',
+  },
+  {
+    id: 'dynamic_motion',
+    name: 'Cảnh Chuỗi Chuyển Động Nhịp Độ (Dynamic Motion Sequence)',
+    icon: '⚡',
+    badge: 'Nhịp Độ Nhanh',
+    description: 'Hook cầm gần rung nhẹ -> POV ngón tay vuốt nhẹ qua bề mặt in ấn -> CTA cảm xúc hài lòng.',
+    color: 'from-purple-600/20 to-indigo-600/20 border-purple-500/40 text-purple-300',
+  },
+  {
+    id: 'functional_utility',
+    name: 'Cảnh Show Tính Năng & Chất Liệu (Functional & Utility Showcase)',
+    icon: '🛠️',
+    badge: 'Công Năng & Độ Bền',
+    description: 'Thao tác sử dụng đời thực, phô diễn độ bền/chất liệu; họa tiết in 100% không bị ngón tay che.',
+    color: 'from-emerald-600/20 to-teal-600/20 border-emerald-500/40 text-emerald-300',
+  },
+  {
+    id: 'continuous_oneshot',
+    name: 'Cảnh Chuyển Động Liền Mạch (Continuous Oneshot Flow)',
+    icon: '🔄',
+    badge: 'Oneshot Liền Mạch',
+    description: 'Cố định góc máy/ánh sáng, hành động tuyến tính: tiếp cận -> tương tác -> sử dụng -> dừng ở góc đẹp.',
+    color: 'from-indigo-600/20 to-blue-600/20 border-indigo-500/40 text-indigo-300',
+  },
+  {
+    id: 'narrative_broll',
+    name: 'Cảnh Kể Chuyện Cảm Xúc (Narrative Arc & B-Roll Integration)',
+    icon: '❤️',
+    badge: 'Cảm Xúc & B-Roll',
+    description: 'Đan xen khoảnh khắc đời sống ý nghĩa (A-Roll) với cận cảnh sản phẩm (B-Roll) đóng vai trò chất xúc tác.',
+    color: 'from-rose-600/20 to-pink-600/20 border-rose-500/40 text-rose-300',
+  },
+];
+

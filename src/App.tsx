@@ -35,7 +35,7 @@ const DEFAULT_KLING_CONFIG: KlingVideoConfig = {
   model: 'kling-v2-6',
   mode: 'pro',
   duration: '5',
-  aspectRatio: '16:9',
+  aspectRatio: '9:16',
   multiShot: false,
   cfgScale: 0.6,
   negativePrompt: '',
@@ -93,6 +93,15 @@ export default function App() {
 
   // Pure in-memory state: xem và tải trực tiếp, không lưu trữ video vào ổ đĩa hay cloud
   const [videoItems, setVideoItems] = useState<VideoGenerationItem[]>([]);
+  const [mergedVideo, setMergedVideo] = useState<{
+    id: string;
+    url: string;
+    clipsCount: number;
+    createdAt: number;
+    transitions?: Array<{ fromIndex: number; toIndex: number; transition: string; duration: number; reason: string }>;
+  } | null>(null);
+  const [isMergingVideo, setIsMergingVideo] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
 
   const [notification, setNotification] = useState<{
     message: string;
@@ -115,9 +124,12 @@ export default function App() {
   };
 
   const handleResetWorkspace = () => {
-    if (videoItems.length > 0) {
+    if (videoItems.length > 0 || mergedVideo) {
       if (window.confirm('Bạn có chắc chắn muốn làm mới không gian làm việc?')) {
         setVideoItems([]);
+        setMergedVideo(null);
+        setIsMergingVideo(false);
+        setMergeError(null);
         showToast('Đã làm mới không gian làm việc', 'info');
       }
     } else {
@@ -128,6 +140,92 @@ export default function App() {
   const handleDeleteItem = (id: string) => {
     setVideoItems((prev) => prev.filter((item) => item.id !== id));
     showToast('Đã xóa video khỏi danh sách', 'info');
+  };
+
+  // Master function to merge all completed scene clips with FFmpeg & AI Smart Transitions
+  const handleMergeCompletedScenes = async (
+    customItems?: VideoGenerationItem[],
+    transitionMode: 'auto' | 'cut' | 'crossfade' | 'slide' = 'auto'
+  ) => {
+    let candidateList = customItems;
+    if (!candidateList || candidateList.length === 0) {
+      // Find the active batch or use all videoItems
+      const latestBatchItem = videoItems.find((i) => i.batchId);
+      if (latestBatchItem && latestBatchItem.batchId) {
+        candidateList = videoItems.filter((i) => i.batchId === latestBatchItem.batchId);
+      } else {
+        candidateList = videoItems;
+      }
+    }
+
+    const completedClips = candidateList
+      .filter((i) => i.status === 'completed' && Boolean(i.resultVideoUrl))
+      .sort((a, b) => (a.sceneIndex ?? 0) - (b.sceneIndex ?? 0) || a.createdAt - b.createdAt);
+
+    if (completedClips.length < 2) {
+      showToast(
+        `Cần ít nhất 2 phân cảnh hoàn thành để ghép video (hiện có ${completedClips.length}/${candidateList.length} cảnh hoàn tất).`,
+        'warning'
+      );
+      return;
+    }
+
+    setIsMergingVideo(true);
+    setMergeError(null);
+    showToast(`AI đang phân tích & dùng FFmpeg ghép ${completedClips.length} phân cảnh...`, 'info');
+
+    try {
+      const videoUrls = completedClips.map((c) => c.resultVideoUrl as string);
+      const scenes = completedClips.map((c, idx) => ({
+        prompt: c.prompt,
+        cameraMotion: c.cameraMovement,
+        purpose: `Phân cảnh ${(c.sceneIndex ?? idx) + 1}`,
+      }));
+
+      const res = await fetch('/api/video/merge-scenes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          videoUrls,
+          scenes,
+          transitionMode,
+          aspectRatio: completedClips[0]?.aspectRatio || '9:16',
+          apiKey: apiConfig.apiKey,
+          visionConfig: apiConfig.visionAnalysis,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Lỗi khi ghép video bằng FFmpeg');
+      }
+
+      const newMerged = {
+        id: data.mergedId,
+        url: data.videoUrl,
+        clipsCount: data.clipsCount || completedClips.length,
+        transitions: data.transitions,
+        createdAt: Date.now(),
+      };
+
+      setMergedVideo(newMerged);
+      try {
+        confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
+      } catch (_) {}
+      showToast(`🎉 Đã tự động phân tích chuyển cảnh & ghép hoàn tất ${completedClips.length} phân cảnh thành 1 Video Hoàn Chỉnh!`, 'success');
+
+      // Scroll to merged video hero section
+      setTimeout(() => {
+        const el = document.getElementById('merged-final-video-section');
+        if (el) el.scrollIntoView({ behavior: 'smooth' });
+      }, 500);
+    } catch (err: any) {
+      console.error('Lỗi khi ghép video với FFmpeg:', err);
+      setMergeError(err?.message || 'Không thể ghép các phân cảnh video');
+      showToast(`Lỗi ghép video: ${err?.message}`, 'warning');
+    } finally {
+      setIsMergingVideo(false);
+    }
   };
 
   const handleEnhancePromptWithGemini = async (rawPrompt: string): Promise<string> => {
@@ -171,44 +269,182 @@ export default function App() {
     return `${rawPrompt}, 8k resolution, cinematic volumetric lighting, hyperrealistic details, smooth 60fps video.`;
   };
 
-  const startVideoTaskSimulation = (newItemId: string) => {
-    let progress = 10;
-    const interval = setInterval(() => {
-      progress += Math.floor(Math.random() * 15) + 10;
-      if (progress >= 100) {
-        progress = 100;
-        clearInterval(interval);
-        setVideoItems((prev) =>
-          prev.map((item) => {
-            if (item.id === newItemId) {
-              return {
-                ...item,
-                status: 'completed',
-                progress: 100,
-                resultVideoUrl:
-                  item.type === 'text_to_video'
-                    ? 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4'
-                    : 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
-                completedAt: Date.now(),
-              };
-            }
-            return item;
-          })
-        );
-        try {
-          confetti({ particleCount: 80, spread: 60, origin: { y: 0.8 } });
-        } catch (_) {}
-        showToast('Tạo Video AI hoàn tất thành công!', 'success');
-      } else {
+  const executeRealKlingVideoTask = async (targetItem: VideoGenerationItem) => {
+    // Transition to generating state
+    setVideoItems((prev) =>
+      prev.map((item) =>
+        item.id === targetItem.id
+          ? { ...item, status: 'generating', progress: 15, error: undefined }
+          : item
+      )
+    );
+
+    try {
+      const klingConf = apiConfig.kling || DEFAULT_KLING_CONFIG;
+      const effectiveApiKey = klingConf.apiKey || apiConfig.apiKey || '';
+      const effectiveAccessKey = klingConf.accessKey || '';
+      const effectiveSecretKey = klingConf.secretKey || '';
+      const effectiveBaseUrl = klingConf.baseUrl || 'https://api.openlux.ai/kling';
+
+      const payload = {
+        image: targetItem.startImageUrl,
+        imageUrl: targetItem.startImageUrl,
+        endImage: targetItem.endImageUrl,
+        endImageUrl: targetItem.endImageUrl,
+        prompt: targetItem.prompt,
+        negative_prompt: targetItem.negativePrompt,
+        camera_movement: targetItem.cameraMovement,
+        duration: targetItem.duration || '5',
+        mode: targetItem.mode || 'pro',
+        aspect_ratio: targetItem.aspectRatio || '9:16',
+        cfg_scale: targetItem.cfgScale ?? 0.6,
+        model_name: targetItem.model || klingConf.model || 'kling-v2-6',
+        apiKey: effectiveApiKey,
+        accessKey: effectiveAccessKey,
+        secretKey: effectiveSecretKey,
+        baseUrl: effectiveBaseUrl,
+      };
+
+      const res = await fetch('/api/kling/create-video', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || !data.success || !data.taskId) {
+        const errMsg = data.error || data.message || `Lỗi máy chủ Kling AI (Mã HTTP: ${res.status})`;
         setVideoItems((prev) =>
           prev.map((item) =>
-            item.id === newItemId
-              ? { ...item, status: 'generating', progress }
+            item.id === targetItem.id
+              ? { ...item, status: 'error', error: errMsg, progress: 0 }
               : item
           )
         );
+        showToast(`Lỗi khởi tạo video: ${errMsg}`, 'warning');
+        return;
       }
-    }, 1500);
+
+      const taskId = data.taskId;
+      setVideoItems((prev) =>
+        prev.map((item) =>
+          item.id === targetItem.id
+            ? { ...item, taskId, status: 'generating', progress: 25 }
+            : item
+        )
+      );
+
+      // Poll task status every 3.5 seconds
+      let pollCount = 0;
+      const maxPoll = 120; // ~7 minutes maximum polling
+      const pollTimer = setInterval(async () => {
+        pollCount++;
+        try {
+          const params = new URLSearchParams();
+          if (effectiveApiKey) params.set('apiKey', effectiveApiKey);
+          if (effectiveAccessKey) params.set('accessKey', effectiveAccessKey);
+          if (effectiveSecretKey) params.set('secretKey', effectiveSecretKey);
+          if (effectiveBaseUrl) params.set('baseUrl', effectiveBaseUrl);
+
+          const statusRes = await fetch(`/api/kling/task-status/${taskId}?${params.toString()}`);
+          const statusData = await statusRes.json().catch(() => ({}));
+
+          if (statusData.status === 'succeed') {
+            clearInterval(pollTimer);
+            setVideoItems((prev) => {
+              const updated = prev.map((item) =>
+                item.id === targetItem.id
+                  ? {
+                      ...item,
+                      status: 'completed' as const,
+                      progress: 100,
+                      resultVideoUrl: statusData.videoUrl,
+                      completedAt: Date.now(),
+                    }
+                  : item
+              );
+
+              // If all queued/generating items in this batch are completed, auto-trigger FFmpeg merge!
+              const targetBatchId = targetItem.batchId;
+              const batchItems = targetBatchId ? updated.filter((it) => it.batchId === targetBatchId) : updated;
+              const allBatchDone =
+                batchItems.length >= 2 &&
+                batchItems.every((it) => it.status === 'completed' && Boolean(it.resultVideoUrl));
+              if (allBatchDone) {
+                const sortedBatch = [...batchItems].sort((a, b) => (a.sceneIndex ?? 0) - (b.sceneIndex ?? 0));
+                setTimeout(() => {
+                  handleMergeCompletedScenes(sortedBatch);
+                }, 1000);
+              }
+
+              return updated;
+            });
+            try {
+              confetti({ particleCount: 80, spread: 60, origin: { y: 0.8 } });
+            } catch (_) {}
+            showToast('Tạo Video Kling AI hoàn tất thành công!', 'success');
+          } else if (statusData.status === 'failed') {
+            clearInterval(pollTimer);
+            const failReason = statusData.error || statusData.statusMsg || 'Kling AI xử lý video thất bại';
+            setVideoItems((prev) =>
+              prev.map((item) =>
+                item.id === targetItem.id
+                  ? { ...item, status: 'error', error: failReason, progress: 0 }
+                  : item
+              )
+            );
+            showToast(`Tạo video thất bại: ${failReason}`, 'warning');
+          } else {
+            // Processing: update progress smoothly between 25% and 95%
+            const prog = Math.min(95, 25 + Math.floor(pollCount * 2));
+            setVideoItems((prev) =>
+              prev.map((item) =>
+                item.id === targetItem.id
+                  ? { ...item, status: 'generating', progress: prog }
+                  : item
+              )
+            );
+          }
+
+          if (pollCount >= maxPoll) {
+            clearInterval(pollTimer);
+            setVideoItems((prev) =>
+              prev.map((item) =>
+                item.id === targetItem.id
+                  ? {
+                      ...item,
+                      status: 'error',
+                      error: 'Quá thời gian chờ tạo video Kling AI (hơn 7 phút). Bạn có thể thử tạo lại.',
+                      progress: 0,
+                    }
+                  : item
+              )
+            );
+          }
+        } catch (pollErr: any) {
+          console.warn('Lỗi kiểm tra trạng thái video:', pollErr);
+        }
+      }, 3500);
+    } catch (err: any) {
+      console.error('Lỗi khi gửi tác vụ Kling AI:', err);
+      setVideoItems((prev) =>
+        prev.map((item) =>
+          item.id === targetItem.id
+            ? { ...item, status: 'error', error: err?.message || 'Lỗi mạng khi kết nối Kling AI', progress: 0 }
+            : item
+        )
+      );
+      showToast(`Lỗi: ${err?.message || 'Không thể kết nối đến máy chủ Kling AI'}`, 'warning');
+    }
+  };
+
+  const handleRetryItem = (id: string) => {
+    const item = videoItems.find((i) => i.id === id);
+    if (item) {
+      showToast('Đang thử tạo lại video với Kling AI...', 'info');
+      executeRealKlingVideoTask(item);
+    }
   };
 
   const handleGenerateTextToVideo = async (params: {
@@ -240,7 +476,7 @@ export default function App() {
     setVideoItems((prev) => [newItem, ...prev]);
     showToast('Đã gửi lệnh tạo Video tới Kling AI...', 'info');
 
-    startVideoTaskSimulation(newItem.id);
+    executeRealKlingVideoTask(newItem);
   };
 
   const handleGenerateImageToVideo = async (params: {
@@ -278,7 +514,7 @@ export default function App() {
     setVideoItems((prev) => [newItem, ...prev]);
     showToast('Đã khởi tạo yêu cầu Animate Ảnh sang Video...', 'info');
 
-    startVideoTaskSimulation(newItem.id);
+    executeRealKlingVideoTask(newItem);
   };
 
   const handleBatchEnqueueVideos = (
@@ -293,8 +529,11 @@ export default function App() {
       startImageUrl?: string;
     }>
   ) => {
+    const currentBatchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const newItems: VideoGenerationItem[] = itemsToEnqueue.map((item, idx) => ({
       id: `vid_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+      batchId: currentBatchId,
+      sceneIndex: idx,
       type: item.startImageUrl ? 'image_to_video' : 'text_to_video',
       startImageUrl: item.startImageUrl,
       prompt: item.prompt,
@@ -310,9 +549,14 @@ export default function App() {
     }));
 
     setVideoItems((prev) => [...newItems, ...prev]);
-    showToast(`Đã thêm ${newItems.length} phân cảnh vào Hàng Đợi Render Video!`, 'success');
+    showToast(`Đã gửi ${newItems.length} phân cảnh vào Kling AI để render video!`, 'success');
 
-    newItems.forEach((it) => startVideoTaskSimulation(it.id));
+    newItems.forEach((it, idx) => {
+      // Stagger dispatch slightly by 300ms to avoid burst limits
+      setTimeout(() => {
+        executeRealKlingVideoTask(it);
+      }, idx * 300);
+    });
   };
 
   const completedCount = videoItems.filter((i) => i.status === 'completed').length;
@@ -359,8 +603,13 @@ export default function App() {
         <VideoStudio
           apiConfig={apiConfig}
           items={videoItems}
+          mergedVideo={mergedVideo}
+          isMergingVideo={isMergingVideo}
+          mergeError={mergeError}
+          onMergeScenes={(mode) => handleMergeCompletedScenes(undefined, mode)}
           onBatchEnqueueVideos={handleBatchEnqueueVideos}
           onDeleteItem={handleDeleteItem}
+          onRetryItem={handleRetryItem}
         />
       </main>
 

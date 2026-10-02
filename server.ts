@@ -1,5 +1,8 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
+import os from "os";
+import { spawn } from "child_process";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import sharp from "sharp";
@@ -329,13 +332,247 @@ async function startServer() {
     }
   });
 
-  // AI Product Analysis & Video Script / Storyboard Generator Endpoint
+  // Helper to prepare compressed reference image part for Gemini multimodal analysis
+  async function prepareProductImagePart(images: string[]): Promise<any> {
+    if (!images || images.length === 0 || typeof images[0] !== "string") return null;
+    try {
+      const firstImg = images[0];
+      let imgBuf: Buffer | null = null;
+      if (firstImg.startsWith("data:")) {
+        const match = firstImg.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+          imgBuf = Buffer.from(match[2], "base64");
+        }
+      } else if (firstImg.startsWith("http://") || firstImg.startsWith("https://")) {
+        console.log(`📥 [Image Helper] Tải ảnh sản phẩm gốc để AI phân tích: ${firstImg.slice(0, 80)}...`);
+        const fRes = await fetch(firstImg, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+          },
+          signal: AbortSignal.timeout(6000),
+        });
+        if (fRes.ok) {
+          const ab = await fRes.arrayBuffer();
+          imgBuf = Buffer.from(ab);
+        }
+      }
+      if (imgBuf) {
+        try {
+          const smallJpg = await sharp(imgBuf)
+            .resize(512, 512, { fit: "inside" })
+            .jpeg({ quality: 80 })
+            .toBuffer();
+          return {
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: smallJpg.toString("base64"),
+            },
+          };
+        } catch {
+          return {
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: imgBuf.toString("base64"),
+            },
+          };
+        }
+      }
+    } catch (imgErr) {
+      console.warn("⚠️ Không thể tải ảnh gửi kèm prompt:", imgErr);
+    }
+    return null;
+  }
+
+  // Helper to execute Gemini multimodal request
+  async function callGeminiVisionText(
+    apiKey: string,
+    promptText: string,
+    imagePart: any,
+    visionConfig?: any,
+    targetModel = "gemini-3.7-flash"
+  ): Promise<string> {
+    let responseText = "";
+    if (apiKey.startsWith("sk-")) {
+      const openluxEndpoint =
+        visionConfig?.baseUrl && visionConfig.baseUrl.trim()
+          ? visionConfig.baseUrl.trim()
+          : `https://api.openlux.ai/v1beta/models/${targetModel}:generateContent`;
+
+      console.log(`📡 [Gemini Gateway] Gọi OpenLux (${targetModel}) tại: ${openluxEndpoint}...`);
+      const parts: any[] = [];
+      if (imagePart) parts.push(imagePart);
+      parts.push({ text: promptText });
+
+      let openluxRes = await fetch(openluxEndpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey.trim()}`,
+          "x-goog-api-key": apiKey.trim(),
+        },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: {
+            responseMimeType: "application/json",
+          },
+        }),
+        signal: AbortSignal.timeout(90000),
+      });
+
+      if (!openluxRes.ok && openluxRes.status === 404) {
+        console.warn(`⚠️ [Gemini Gateway] Endpoint ${targetModel} trả về 404, thử fallback sang gemini-2.5-flash...`);
+        openluxRes = await fetch("https://api.openlux.ai/v1beta/models/gemini-2.5-flash:generateContent", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey.trim()}`,
+            "x-goog-api-key": apiKey.trim(),
+          },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts }],
+            generationConfig: { responseMimeType: "application/json" },
+          }),
+          signal: AbortSignal.timeout(90000),
+        });
+      }
+
+      if (!openluxRes.ok) {
+        const errText = await openluxRes.text();
+        throw new Error(`OpenLux Gemini Gateway báo lỗi (${openluxRes.status}): ${errText.slice(0, 200)}`);
+      }
+
+      const openluxData: any = await openluxRes.json();
+      if (openluxData?.candidates?.[0]?.content?.parts) {
+        for (const part of openluxData.candidates[0].content.parts) {
+          if (part.text && !part.thought) {
+            responseText += part.text;
+          }
+        }
+      }
+    } else {
+      console.log(`📡 [Gemini Official] Gọi Google GenAI SDK (${targetModel})...`);
+      const client = new GoogleGenAI({
+        apiKey: apiKey.trim(),
+        httpOptions: { headers: { "User-Agent": "aistudio-build" } },
+      });
+
+      const contents: any[] = [];
+      if (imagePart) contents.push(imagePart);
+      contents.push(promptText);
+
+      let geminiResponse;
+      try {
+        geminiResponse = await client.models.generateContent({
+          model: targetModel,
+          contents: contents as any,
+        });
+      } catch (mErr: any) {
+        console.warn(`⚠️ Không thể gọi ${targetModel} với Google SDK, thử fallback gemini-2.5-flash:`, mErr?.message);
+        geminiResponse = await client.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: contents as any,
+        });
+      }
+
+      responseText = geminiResponse.text || "";
+    }
+    return responseText;
+  }
+
+  // 1. DEDICATED PRE-ANALYSIS: Endpoint phân tích chi tiết đặc tính sản phẩm TRƯỚC
+  app.post("/api/product/analyze-details", async (req, res) => {
+    try {
+      const {
+        title,
+        description,
+        images = [],
+        customKey,
+        visionConfig,
+        model = "gemini-3.7-flash",
+      } = req.body;
+      const apiKey = (customKey && customKey.trim()) || process.env.GEMINI_API_KEY;
+
+      if (!apiKey) {
+        return res.status(400).json({ error: "Thiếu Gemini API Key để thực hiện phân tích sản phẩm" });
+      }
+
+      const imagePart = await prepareProductImagePart(images);
+
+      const prompt = `
+Bạn là một Chuyên Gia Giám Định Sản Phẩm Cao Cấp & Trưởng Phòng Kiểm Soát Chất Lượng POD (Print-on-Demand) / Sản phẩm in ấn theo yêu cầu & Quà tặng cá nhân hóa quốc tế.
+
+NHIỆM VỤ TỐI QUAN TRỌNG:
+Hãy phân tích cực kỳ tỉ mỉ, chính xác và chuyên sâu toàn bộ đặc tính vật lý và thẩm mỹ của sản phẩm này.
+Mục tiêu là để toàn bộ các thông số này sau đó sẽ được đưa vào TỪNG CÂU LỆNH PROMPT tạo ảnh và video AI phân cảnh, giúp AI tái tạo chính xác 100% hình dáng, tỷ lệ, chất liệu và họa tiết in ấn mà KHÔNG BỊ BIẾN DẠNG HÌNH HỌC.
+
+THÔNG TIN SẢN PHẨM:
+- Tên sản phẩm: ${title || "Chưa có tiêu đề"}
+- Mô tả: ${description || "Chưa có mô tả"}
+- Ảnh sản phẩm tham chiếu: ${imagePart ? "[Đã đính kèm ảnh chụp thực tế để kiểm tra trực quan]" : "Dựa trên mô tả và tên"}
+
+YÊU CẦU PHÂN TÍCH TỪNG TRƯỜNG THÔNG TIN:
+1. "productName": Tên và loại sản phẩm chuẩn xác (ví dụ: "Đĩa thủy tinh tròn vát cạnh treo cây thông Noel (Round Glass Ornament)", "Cốc gốm sứ trắng 11oz", "Bình giữ nhiệt Tumbler inox 304 20oz", "Tranh mica đèn LED", v.v.).
+2. "category": Thể loại sản phẩm (ví dụ: "Đồ trang trí Giáng Sinh / Noel", "Cốc / Ly sứ", "Bình giữ nhiệt", "Áo thun thời trang", "Trang sức / Phụ kiện", "Quà tặng in ấn", v.v.).
+3. "material": Chất liệu thực tế và đặc tính bề mặt quang học (ví dụ: "Thủy tinh trong suốt cao cấp vát cạnh beveled tinh xảo, có độ khúc xạ ánh sáng lấp lánh tự nhiên", hoặc "Gốm sứ tráng men bóng cao cấp", hoặc "Inox 304 sơn tĩnh điện chải xước").
+4. "shape": Hình dạng hình học chính xác.
+   => CẢNH BÁO CHỐNG BIẾN DẠNG RẤT QUAN TRỌNG: Nêu rõ cấu trúc hình học (ví dụ: "Miếng đĩa tròn dẹt phẳng 2D vát cạnh, có khoen xỏ dây phía trên - TUYỆT ĐỐI KHÔNG PHẢI quả cầu 3D / sphere / ball", hoặc "Khối trụ tròn thẳng đứng có nắp đậy và quai xách", hoặc "Tấm phẳng chữ nhật").
+5. "dimensions": Kích thước và tỷ lệ vật lý thật trong đời sống (ví dụ: "Đường kính tiêu chuẩn ~3.5 inch (khoảng 8.9cm), độ dày tấm kính ~3.5mm, khi cầm trên tay tỷ lệ vừa vặn trong lòng bàn tay người lớn").
+6. "designDetails": Chi tiết họa tiết thiết kế in ấn & Typography (Mô tả chi tiết hình vẽ minh họa, từng câu chữ/typography in trên sản phẩm, màu sắc chủ đạo, độ sắc nét tack-sharp, vị trí in chính diện hay quanh thân).
+7. "finish": Độ bóng, độ trong suốt và phụ kiện đi kèm (ví dụ: "Bề mặt kính bóng bẩy phản chiếu ánh đèn lấp lánh, đi kèm dây treo ruy bằng kim tuyến vàng ánh kim sang trọng").
+8. "keyFeatures": 2-3 điểm nhấn đắt giá nhất của sản phẩm giúp làm nổi bật vẻ đẹp thương mại.
+9. "promptSnippet": Một đoạn mô tả chuẩn xác bằng TIẾNG ANH (khoảng 2-3 câu) ghi rõ Tên sản phẩm, Chất liệu thật, Cấu trúc hình học chuẩn xác (chống nhầm 2D/3D), Kích thước thật và Yêu cầu bảo toàn 100% họa tiết in ấn để nhúng vào Prompt.
+
+Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng định dạng sau (không bọc trong bất kỳ văn bản nào khác ngoài JSON):
+{
+  "productSpecs": {
+    "productName": "...",
+    "category": "...",
+    "material": "...",
+    "shape": "...",
+    "dimensions": "...",
+    "designDetails": "...",
+    "finish": "...",
+    "keyFeatures": "...",
+    "promptSnippet": "..."
+  },
+  "productSummary": "Tóm tắt ngắn gọn điểm nổi bật nhất của sản phẩm"
+}
+`;
+
+      const responseText = await callGeminiVisionText(apiKey, prompt, imagePart, visionConfig, model);
+      let jsonString = responseText.replace(/```json/gi, "").replace(/```/g, "").trim();
+
+      let parsedData;
+      try {
+        parsedData = JSON.parse(jsonString);
+      } catch {
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          parsedData = JSON.parse(jsonMatch[0]);
+        } else {
+          throw new Error("Không thể phân tích phản hồi JSON từ Gemini");
+        }
+      }
+
+      return res.json({
+        success: true,
+        productSpecs: parsedData.productSpecs,
+        productSummary: parsedData.productSummary || "",
+      });
+    } catch (err: any) {
+      console.error("❌ [Analyze Product Details Error]:", err);
+      return res.status(500).json({ error: err?.message || "Lỗi khi phân tích chi tiết sản phẩm" });
+    }
+  });
+
+  // 2. STORYBOARD GENERATOR: Lên kịch bản phân cảnh và NHÚNG TRỰC TIẾP THÔNG TIN CHI TIẾT SẢN PHẨM VÀO TỪNG PROMPT
   app.post("/api/product/analyze-and-script", async (req, res) => {
     try {
       const {
         title,
         description,
         images = [],
+        productSpecs, // Pre-analyzed and reviewed/edited product specifications
         customKey,
         visionConfig,
         model = "gemini-3.7-flash",
@@ -347,223 +584,183 @@ async function startServer() {
         return res.status(400).json({ error: "Thiếu Gemini API Key để thực hiện phân tích kịch bản" });
       }
 
-      // Prepare product reference image for visual multimodal inspection (compressed to 512px for lightning speed)
-      let imagePart: any = null;
-      if (images && images.length > 0 && typeof images[0] === "string") {
-        try {
-          const firstImg = images[0];
-          let imgBuf: Buffer | null = null;
-          if (firstImg.startsWith("data:")) {
-            const match = firstImg.match(/^data:([^;]+);base64,(.+)$/);
-            if (match) {
-              imgBuf = Buffer.from(match[2], "base64");
-            }
-          } else if (firstImg.startsWith("http://") || firstImg.startsWith("https://")) {
-            console.log(`📥 [Analyze Script] Tải ảnh sản phẩm gốc để Gemini 3.7 Flash phân tích: ${firstImg.slice(0, 80)}...`);
-            const fRes = await fetch(firstImg, {
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-              },
-              signal: AbortSignal.timeout(6000),
-            });
-            if (fRes.ok) {
-              const ab = await fRes.arrayBuffer();
-              imgBuf = Buffer.from(ab);
-            }
-          }
-          if (imgBuf) {
-            // Compress with sharp to 512x512 JPEG for rapid transfer without network latency
-            try {
-              const smallJpg = await sharp(imgBuf)
-                .resize(512, 512, { fit: "inside" })
-                .jpeg({ quality: 80 })
-                .toBuffer();
-              imagePart = {
-                inlineData: {
-                  mimeType: "image/jpeg",
-                  data: smallJpg.toString("base64"),
-                },
-              };
-            } catch {
-              imagePart = {
-                inlineData: {
-                  mimeType: "image/jpeg",
-                  data: imgBuf.toString("base64"),
-                },
-              };
-            }
-          }
-        } catch (imgErr) {
-          console.warn("⚠️ Không thể tải ảnh gửi kèm prompt phân tích, tiếp tục phân tích qua mô tả:", imgErr);
-        }
-      }
+      const imagePart = await prepareProductImagePart(images);
 
-      const prompt = `
-Bạn là một Chuyên Gia Giám Định Sản Phẩm & Đạo Diễn Video Quảng Cáo POD (Print-on-Demand) / Sản phẩm in ấn & quà tặng cá nhân hóa đẳng cấp quốc tế.
+      // Extract optional user scene style preference
+      const { sceneStylePreference = "balanced" } = req.body;
 
-MỤC TIÊU TỐI THƯỢNG:
-Phân tích cực kỳ chi tiết, cụ thể và sâu sắc toàn bộ đặc tính vật lý của sản phẩm: từ Tên sản phẩm, Chất liệu thực tế, Hình dạng hình học, Kích thước tỷ lệ thật, Cấu trúc, Bề mặt đến từng chi tiết Họa tiết thiết kế in ấn.
-Toàn bộ thông tin phân tích chi tiết này PHẢI ĐƯỢC ĐƯA TRỰC TIẾP VÀO TỪNG CÂU LỆNH "imagePrompt" để AI tạo ảnh phân cảnh (Midjourney / GPT-Image-2 / Gemini) tái tạo chuẩn xác 100% hình dáng, kích thước, tỷ lệ và chất liệu thực tế của sản phẩm mà KHÔNG BỊ BIẾN DẠNG HÌNH HỌC (ví dụ: đĩa tròn phẳng thì phải là đĩa tròn phẳng, không được biến thành quả cầu tròn hay méo mó tỷ lệ).
+      const podAdaptiveSceneKnowledge = `
+HỆ THỐNG ĐẠO DIỄN AI - TỰ ĐỘNG ĐỀ XUẤT 5 PHÂN CẢNH TÙY BIẾN ĐỘC QUYỀN CHO TỪNG LOẠI SẢN PHẨM:
 
-LƯU Ý CỐT LÕI VỀ LỜI THOẠI:
-- Ở TỪNG KHUNG HÌNH SẼ KHÔNG CÓ LỜI THOẠI (HOÀN TOÀN KHÔNG CÓ VOICEOVER, KHÔNG TẠO TRƯỜNG "voiceover").
-- Video tập trung 100% vào ngôn ngữ thị giác điện ảnh (Visual Cinematography), sự hoàn mỹ của thiết kế in, ánh sáng chân thực và chuyển động camera mượt mà.
+BẠN LÀ MỘT ĐẠO DIỄN QUẢNG CÁO QUỐC TẾ. NHIỆM VỤ CỦA BẠN LÀ TỰ ĐỘNG PHÂN TÍCH THỂ LOẠI SẢN PHẨM VÀ ĐỀ XUẤT 4 ĐẾN 5 PHÂN CẢNH PHÙ HỢP NHẤT VỚI CÔNG NĂNG VÀ BỐI CẢNH THỰC TẾ CỦA SẢN PHẨM ĐÓ:
 
-THÔNG TIN SẢN PHẨM TỪ WEBSITE:
-- Tên sản phẩm: ${title}
-- Mô tả sản phẩm: ${description}
-- Ảnh sản phẩm tham chiếu: ${imagePart ? "[Đã đính kèm ảnh chụp thực tế để kiểm tra trực quan]" : "Dựa trên mô tả và tên"}
+HƯỚNG DẪN ĐỀ XUẤT THEO TỪNG DANH MỤC SẢN PHẨM (Ví dụ tham khảo để AI tự do sáng tạo linh hoạt):
+1. Đồ Uống / Cốc Ly / Bình Giữ Nhiệt (Mug, Tumbler, Water Bottle):
+   - Cảnh 1: Cầm tay nhấp ngụm cà phê sáng bên khung cửa sổ ngập tràn ánh nắng.
+   - Cảnh 2: Mở hộp quà trang trọng trên bàn gỗ hoặc đặt vào khay đựng cốc trên ô tô / bàn làm việc.
+   - Cảnh 3: Cận cảnh Macro vát cạnh, giọt nước đọng hoặc vệt phản chiếu ánh sáng trên lớp men gốm/inox.
+   - Cảnh 4: Rót nước hoặc đặt bên laptop bàn làm việc hiện đại.
+   - Cảnh 5: Nụ cười sảng khoái của nhân vật cầm cốc chào ngày mới.
 
-YÊU CẦU PHÂN TÍCH SẢN PHẨM BẮT BUỘC:
-1. Tên & Loại sản phẩm (Product Title & Category): Xác định rõ ràng bản chất sản phẩm là gì (ví dụ: Glass ornament đĩa tròn treo cây thông Noel, Cốc gốm sứ Ceramic mug, Tumbler giữ nhiệt inox 304, Áo thun cotton, Tranh mica acrylic, v.v.).
-2. Chất liệu cụ thể (Material): Nhận diện chất liệu thật và đặc tính quang học/bề mặt (ví dụ: Thủy tinh trong suốt cao cấp vát cạnh beveled, kính có độ khúc xạ ánh sáng tự nhiên; hoặc gốm sứ tráng men bóng; hoặc kim loại chải xước; hoặc vải dệt tự nhiên).
-3. Hình dạng hình học chính xác (Exact Shape & Geometry): Cấu trúc hình học vật lý của sản phẩm là gì? (Ví dụ: Miếng đĩa tròn dẹt 2D vát cạnh phẳng, có lỗ khuyên xỏ dây phía trên; hoặc Khối trụ thẳng đứng có nắp; hoặc Mặt phẳng hình chữ nhật).
-   => CẢNH BÁO QUAN TRỌNG: BẮT BUỘC mô tả rõ ràng để AI KHÔNG NHẦM LẪN (ví dụ: Round shaped glass ornament là ĐĨA TRÒN DẸT phẳng 2D, TUYỆT ĐỐI KHÔNG PHẢI quả cầu 3D tròn xoe / sphere / ball).
-4. Kích thước & Tỷ lệ vật lý thật (Dimensions & Realistic Scale): Kích thước thật tiêu chuẩn của sản phẩm (ví dụ: Đường kính ~3.5 inch (khoảng 8.9cm), độ dày tấm kính 3mm; hoặc Chiều cao 20cm, đường kính 7cm). Khi người cầm trên tay hoặc treo trên cây/đặt trên bàn, tỷ lệ kích thước phải hoàn toàn tự nhiên và tương xứng với thực tế, không bị to ngoại cỡ hay tí hon.
-5. Họa tiết thiết kế in ấn (Custom Design & Artwork Details): Mô tả chi tiết hình vẽ minh họa, font chữ, câu trích dẫn/typography, vị trí in, màu sắc chủ đạo và độ tương phản.
-6. Chi tiết phụ kiện & Bề mặt (Accessories & Surface Finish): Dây ruy băng treo (dây kim tuyến vàng/bạc/ruy băng đỏ), nắp đậy, quai cầm, độ bóng và phản chiếu bề mặt.
+2. Đồ Trang Trí / Ornament Giáng Sinh / Keepsake (Acrylic / Glass / Ceramic Ornament):
+   - Cảnh 1: Cận cảnh cầm tay trực diện UGC khoe trọn họa tiết in ấn và độ trong suốt của thủy tinh/mica.
+   - Cảnh 2: Mở nắp hộp quà thắt nơ đỏ nhấc ornament từ khay lót nhung.
+   - Cảnh 3: Siêu cận Macro góc nghiêng 30 độ bắt vệt sáng lấp lánh trên mép vát kim cương (beveled edge).
+   - Cảnh 4: Treo vững chắc trên cành thông Noel xanh mướt lung linh ánh đèn vàng ấm áp.
+   - Cảnh 5: Nụ cười hạnh phúc của nhân vật bên cây thông Noel ngắm nhìn sản phẩm.
 
-YÊU CẦU CẤU TRÚC KỊCH BẢN (4 - 5 CẢNH):
-- Khung hình: Luôn luôn là tỷ lệ DỌC 9:16 (Vertical 9:16).
-- Mỗi cảnh là một góc quay nghệ thuật thương mại khác nhau:
-  + Cảnh 1 (Hook/Hero Shot): Cận cảnh trực diện hoặc góc nghiêng 45 độ làm nổi bật họa tiết thiết kế và độ trong suốt/sắc nét của chất liệu.
-  + Cảnh 2 (Detail/Scale Shot): Cảnh người cầm tự nhiên trên tay hoặc tương tác gần, thể hiện rõ tỷ lệ kích thước thật, chất liệu chân thật.
-  + Cảnh 3 (Lifestyle/Context Shot): Đặt trong bối cảnh đời thực ấm cúng tự nhiên (như treo trên nhánh cây thông Noel ấm áp với đèn bokeh, hoặc đặt trên bàn bên ly cà phê).
-  + Cảnh 4 (Packaging/Gift/CTA Shot): Đặt trong hộp quà sang trọng hoặc góc quay tôn vinh sản phẩm hoàn chỉnh, kích thích sở hữu.
+3. Thời Trang & May Mặc (T-shirt, Hoodie, Nón, Giày):
+   - Cảnh 1: Người mẫu mặc áo dạo phố phong cách streetwear tự tin, máy quay tracking chuyển động.
+   - Cảnh 2: Gấp phẳng flatlay trên nền gỗ mở hộp unboxing hoặc vuốt phẳng ngực áo.
+   - Cảnh 3: Cực cận Macro sợi dệt cotton và độ sắc nét của hình in trên vải.
+   - Cảnh 4: Phối đồ (lookbook) trước gương hoặc dạo bước trong quán cà phê thời thượng.
+   - Cảnh 5: Người mẫu tạo dáng nở nụ cười tự tin, truyền cảm hứng sở hữu.
 
-CẤU TRÚC "imagePrompt" Ở MỖI CẢNH (RẤT QUAN TRỌNG):
-- "imagePrompt" bằng TIẾNG ANH chuyên nghiệp, chi tiết cao, BẮT BUỘC chứa:
-  + Tên sản phẩm chính xác, chất liệu cụ thể (e.g. premium clear beveled glass).
-  + Hình dáng chính xác (e.g. flat circular round disc ornament, NOT a sphere or ball).
-  + Kích thước & tỷ lệ vật lý thật (e.g. accurate 3.5-inch diameter, 3mm thickness, realistic hand-held scale).
-  + Yêu cầu tái tạo 100% họa tiết in, câu chữ typography từ ảnh tham chiếu, sắc nét tack-sharp, không nhòe.
-  + Ánh sáng thương mại tự nhiên (natural commercial studio lighting, soft reflections, genuine physical texture).
-  + Định dạng dọc 9:16 (Vertical 9:16 commercial advertisement photograph), 8k resolution, photorealistic.
+4. Quà Tặng Đèn LED / Tranh Mica / Tranh Canvas / Trang Trí Nhà Cửa:
+   - Cảnh 1: Đặt trên bàn đầu giường hoặc kệ sách, bật công tắc đèn LED tỏa ánh sáng ấm cúng.
+   - Cảnh 2: Mở hộp quà lót xốp bảo vệ sang trọng.
+   - Cảnh 3: Cận cảnh độ trong trẻo của mica, bề mặt vân vải canvas và chi tiết in siêu nét.
+   - Cảnh 4: Toàn cảnh căn phòng ngủ/phòng khách ấm cúng với sản phẩm làm điểm nhấn thẩm mỹ.
+   - Cảnh 5: Cặp đôi hoặc nhân vật xúc động ngắm nhìn thông điệp in trên sản phẩm.
 
-CẤU TRÚC "videoPrompt" Ở MỖI CẢNH:
-- Mô tả chuyển động camera tinh tế (zoom in, pan, slow glide) giữ nguyên họa tiết in ấn và hình dáng sản phẩm, 4k photorealistic.
+5. Trang Sức / Phụ Kiện Cá Nhân / Móc Khóa / Ví Da:
+   - Cảnh 1: Đeo trên cổ/cổ tay hoặc cầm trên tay kết hợp trang phục tinh tế.
+   - Cảnh 2: Mở hộp nhung trang sức sang trọng hé lộ sản phẩm lấp lánh.
+   - Cảnh 3: Macro phản chiếu ánh sáng kim loại, đá quý hoặc đường may viền da tinh xảo.
+   - Cảnh 4: Đặt vào túi xách hoặc tương tác trong sinh hoạt hàng ngày.
+   - Cảnh 5: Biểu cảm ngạc nhiên, xúc động khi nhận được món quà cá nhân hóa.
 
-KHÔNG CÓ TRƯỜNG "voiceover" TRONG TỪNG PHÂN CẢNH.
+QUY TẮC BẮT BUỘC ĐẢM BẢO TÍNH ĐA DẠNG & THỰC TẾ (STRICT RULES):
+1. TỰ ĐỘNG THÍCH ỨNG: AI tự động phân tích và tạo các phân cảnh phù hợp 100% với công năng của sản phẩm. Không áp đặt cảnh treo cây thông cho cốc, không áp đặt cảnh mặc áo cho tranh mica.
+2. KHÔNG TRÙNG LẶP: Mỗi phân cảnh trong kịch bản PHẢI CÓ GÓC MÁY (Camera Angle), BỐI CẢNH (Setting/Environment), THAO TÁC (Action) và BỐ CỤC KHÁC NHAU 100%.
+3. TONE ẢNH CHÂN THẬT NHƯ CHỤP IPHONE (AUTHENTIC IPHONE PHOTOGRAPHY - ZERO PLASTIC / ZERO AI LOOK):
+   - Phong cách chụp: Ảnh chụp tự nhiên từ camera điện thoại iPhone (Shot on iPhone snapshot, 24mm/48mm lens, raw unedited photo).
+   - Tông màu & Ánh sáng: Ánh sáng ban ngày tự nhiên (ambient daylight), độ tương phản mềm mại tự nhiên, màu sắc trung thực không bị rực rỡ quá mức (accurate true-to-life colors).
+   - Tuyệt đối KHÔNG nhựa (NO plastic sheen), KHÔNG sáp bóng AI (NO waxy skin), KHÔNG đồ họa 3D render, KHÔNG hiệu ứng ảo nhân tạo.
+   - Da người thật: Rõ vân da, lỗ chân lông tự nhiên (microscopic pores), tông da ấm áp chân thực đời thường.
+4. VIDEO MỖI CẢNH LÀ ONESHOT KHÔNG CHUYỂN CẢNH (SINGLE CONTINUOUS ONE-SHOT TAKE):
+   - Mỗi phân cảnh 5s là MỘT ĐOẠN QUAY LIÊN TỤC DUY NHẤT (Single continuous uncut camera recording).
+   - Tuyệt đối KHÔNG cắt cảnh, KHÔNG nhảy cảnh, KHÔNG đổi góc máy đột ngột bên trong một phân cảnh 5s.
+5. SẢN PHẨM KHÔNG TỰ Ý CHUYỂN ĐỘNG (STRICT INANIMATE PHYSICS & ZERO PHANTOM MOVEMENT):
+   - Sản phẩm là vật vô tri vô giác: TUYỆT ĐỐI KHÔNG TỰ XOAY, KHÔNG TỰ LƠ LỬNG BAY TRONG KHÔNG TRUNG, KHÔNG TỰ NHẤC LÊN ĐẶT XUỐNG nếu không có bàn tay người tác động.
+   - Khi sản phẩm đặt trên bàn, trên kệ, trong hộp quà hoặc treo trên cây: Sản phẩm PHẢI ĐỨNG YÊN HOÀN TOÀN 100% TẠI VỊ TRÍ CỐ ĐỊNH (completely stationary static object anchored firmly). Chuyển động duy nhất trong cảnh là góc máy quay di chuyển nhẹ nhàng.
+   - Khi có người mẫu/bàn tay thao tác: Sản phẩm CHỈ di chuyển theo lực cầm và hướng di chuyển của bàn tay người thật.
+6. CHUYỂN ĐỘNG ĐỜI THƯỜNG & KHÔNG SLOW-MOTION (STANDARD 1.0X REAL-TIME SPEED):
+   - Chuyển động camera có độ thở (organic camera breathing) và độ rung lắc tự nhiên nhẹ nhàng như người cầm điện thoại quay video đời thực.
+   - Tốc độ chuẩn 1.0x thời gian thực, tuyệt đối KHÔNG slow-motion, không giật lag.
+7. BẢO TOÀN THIẾT KẾ GỐC 100%: Mọi hình in, chữ viết, logo, họa tiết và màu sắc từ ảnh tham chiếu phải được giữ nguyên vẹn, sắc nét tack-sharp, không bị biến dạng, không bị méo mó khi chuyển động.
+8. VẬT LÝ VỮNG CHẮC: Luôn có điểm tựa vững chắc (cầm trên tay, đặt trên bàn, đeo trên người, treo trên giá). TUYỆT ĐỐI KHÔNG LƠ LỬNG TRONG KHÔNG KHÍ.
+9. THỜI LƯỢNG: Mỗi cảnh đúng 5 giây, toàn bộ kịch bản gồm 4 đến 5 phân cảnh.
+`;
 
-Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc sau (không bọc trong bất kỳ văn bản nào khác ngoài JSON):
+      let prompt = "";
+      if (productSpecs && productSpecs.productName) {
+        prompt = `
+Bạn là một Đạo Diễn Video Quảng Cáo POD (Print-on-Demand) / Quà tặng cá nhân hóa đẳng cấp quốc tế.
+
+${podAdaptiveSceneKnowledge}
+
+THÔNG SỐ VẬT LÝ VÀ ĐẶC TÍNH SẢN PHẨM ĐÃ ĐƯỢC GIÁM ĐỊNH CHI TIẾT:
+- Tên & Loại sản phẩm: ${productSpecs.productName}
+- Thể loại: ${productSpecs.category || "Sản phẩm POD / Quà tặng"}
+- Chất liệu thực tế: ${productSpecs.material}
+- Hình dạng hình học chính xác: ${productSpecs.shape}
+- Kích thước & Tỷ lệ thật trong đời sống: ${productSpecs.dimensions}
+- Họa tiết in ấn & Typography/Chữ viết: ${productSpecs.designDetails}
+- Phụ kiện & Bề mặt hoàn thiện: ${productSpecs.finish}
+- Điểm nhấn nổi bật: ${productSpecs.keyFeatures || ""}
+- Đoạn mô tả tiếng Anh chuẩn hóa: ${productSpecs.promptSnippet || ""}
+
+YÊU CẦU DỰNG KỊCH BẢN:
+Hãy tự động phân tích sản phẩm "${productSpecs.productName}" và đề xuất 4-5 phân cảnh hoàn toàn phù hợp với loại sản phẩm này (Vertical 9:16, mỗi cảnh đúng 5s, không lời thoại, quay oneshot).
+
+YÊU CẦU CHO TỪNG CÂU LỆNH "imagePrompt" (BẰNG TIẾNG ANH - TONE ẢNH CHỤP IPHONE ĐỜI THƯỜNG, KHÔNG NHỰA, KHÔNG AI SÁP BÓNG):
+- Format: "Vertical 9:16 authentic iPhone snapshot photograph of [${productSpecs.productName}], [Góc máy & Bối cảnh đời thường đặc thù cho sản phẩm này], [Thao tác cầm nắm thực tế của bàn tay người hoặc đặt vững chãi trên mặt bàn/kệ, zero floating], shot on iPhone 15 Pro camera, 24mm lens, raw unedited mobile photo, natural diffused daylight, genuine human skin texture with visible microscopic pores and realistic skin tone, absolutely no plastic sheen, no waxy AI skin, no 3D CGI render, crafted from [${productSpecs.material}], precise shape [${productSpecs.shape}], realistic scale [${productSpecs.dimensions}], 100% identical printed artwork and crisp legible typography from reference image, authentic ambient soft shadows, photorealistic 8k."
+
+YÊU CẦU CHO TỪNG CÂU LỆNH "videoPrompt" (BẰNG TIẾNG ANH - SINGLE ONESHOT TAKE, ĐIỆN THOẠI QUAY, SẢN PHẨM ĐỨNG YÊN NẾU KHÔNG CÓ TAY NGƯỜI, KHÔNG SLOW MOTION):
+- Format: "Vertical 9:16 single continuous one-shot UGC video of [${productSpecs.productName}], [Chuyển động camera điện thoại và thao tác tay người nếu có], single continuous take without cuts, continuous camera recording from start to finish, zero scene switching, shot on mobile phone camera, standard 1.0x real-time speed, authentic real-life movement, product remains completely stationary anchored on surface unless held or moved by real human hands, strictly no self-rotation, no autonomous movement, no floating, strictly no slow motion, printed artwork and typography remain 100% stable, sharp and distortion-free, natural physics and gravity, 4k ultra realistic."
+
+Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc sau:
 {
   "productSpecs": {
-    "productName": "Tên và loại sản phẩm chuẩn xác",
-    "material": "Chất liệu cụ thể và đặc tính bề mặt",
-    "shape": "Hình dạng hình học chính xác (nhấn mạnh cấu trúc phẳng/trụ/khối để không bị biến dạng)",
-    "dimensions": "Kích thước & tỷ lệ vật lý thật trong đời sống",
-    "designDetails": "Chi tiết họa tiết in ấn, hình ảnh, typography và màu sắc",
-    "finish": "Độ bóng, độ trong suốt, phụ kiện đi kèm"
+    "productName": "${productSpecs.productName}",
+    "category": "${productSpecs.category || ""}",
+    "material": "${productSpecs.material}",
+    "shape": "${productSpecs.shape}",
+    "dimensions": "${productSpecs.dimensions}",
+    "designDetails": "${productSpecs.designDetails}",
+    "finish": "${productSpecs.finish}",
+    "keyFeatures": "${productSpecs.keyFeatures || ""}",
+    "promptSnippet": "${productSpecs.promptSnippet || ""}"
   },
-  "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm POD",
-  "adConcept": "Ý tưởng kịch bản thị giác không lời thoại",
+  "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm",
+  "adConcept": "Ý tưởng kịch bản thị giác tùy biến linh hoạt cho sản phẩm này",
   "scriptTitle": "Tiêu đề video quảng cáo",
   "scenes": [
     {
       "sceneNumber": 1,
-      "sceneType": "Hero Shot",
-      "title": "Cảnh 1: Cận cảnh chất liệu và họa tiết sắc nét",
+      "sceneType": "Tên thể loại cảnh tự đề xuất (ví dụ: Cảnh Cầm tay UGC / Cảnh Mở hộp quà / Cảnh Bàn làm việc / Cảnh Dạo phố / ...)",
+      "title": "Cảnh 1: Tiêu đề mô tả cảnh phù hợp với sản phẩm",
       "visualDescription": "Mô tả khung hình thị giác dọc 9:16 chân thực...",
-      "productFocus": "Góc máy đặc tả chất liệu trong suốt và thiết kế in sắc nét...",
-      "imagePrompt": "Vertical 9:16 commercial photograph of [Tên sản phẩm], crafted from genuine [Chất liệu], featuring a precise [Hình dạng & Kích thước cụ thể e.g. flat circular 3.5-inch glass disc, 3mm thickness, beveled transparent edge, top hanging loop with gold ribbon, NOT a sphere]. The custom printed artwork, typography text and graphic illustrations from the reference product image are 100% tack-sharp, completely legible, vibrant and perfectly centered. Authentic commercial lighting, realistic crystal reflections, warm cozy festive background with soft bokeh blur, 8k resolution, photorealistic, perfectly accurate physical scale.",
-      "videoPrompt": "Vertical 9:16 cinematic commercial video of [Tên sản phẩm], subtle slow zoom-in highlighting the custom printed artwork and [Chất liệu] texture, soft natural lighting gleam, the printed design remains completely sharp and stable, 4k commercial grade.",
-      "cameraMotion": "zoom_in",
+      "productFocus": "Đặc tả chi tiết sản phẩm trong cảnh này...",
+      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ... shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, no waxy AI skin, crisp legible typography from reference image, photorealistic 8k",
+      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of [${productSpecs.productName}], ... single continuous take without cuts, standard 1.0x real-time speed, stationary static product unless held by hand, strictly no self-rotation, no floating, strictly no slow motion, natural physics, 4k",
+      "cameraMotion": "handheld",
       "duration": "5"
     }
   ]
 }
 `;
-
-      // Target model: gemini-3.7-flash
-      const targetModel = "gemini-3.7-flash";
-      let responseText = "";
-
-      if (apiKey.startsWith("sk-")) {
-        const openluxEndpoint = visionConfig?.baseUrl && visionConfig.baseUrl.trim()
-          ? visionConfig.baseUrl.trim()
-          : `https://api.openlux.ai/v1beta/models/${targetModel}:generateContent`;
-
-        console.log(`📡 [Analyze Script] Gọi OpenLux Gemini Gateway (${targetModel}) tại: ${openluxEndpoint}...`);
-        const parts: any[] = [];
-        if (imagePart) parts.push(imagePart);
-        parts.push({ text: prompt });
-
-        let openluxRes = await fetch(openluxEndpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey.trim()}`,
-            "x-goog-api-key": apiKey.trim(),
-          },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts }],
-            generationConfig: {
-              responseMimeType: "application/json",
-            },
-          }),
-          signal: AbortSignal.timeout(90000), // 90 seconds timeout to prevent premature aborts
-        });
-
-        // Fallback to gemini-2.5-flash if 3.7-flash endpoint is not found
-        if (!openluxRes.ok && openluxRes.status === 404) {
-          console.warn(`⚠️ [Analyze Script] Endpoint ${targetModel} trả về 404, thử fallback sang gemini-2.5-flash...`);
-          openluxRes = await fetch("https://api.openlux.ai/v1beta/models/gemini-2.5-flash:generateContent", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${apiKey.trim()}`,
-              "x-goog-api-key": apiKey.trim(),
-            },
-            body: JSON.stringify({
-              contents: [{ role: "user", parts }],
-              generationConfig: { responseMimeType: "application/json" },
-            }),
-            signal: AbortSignal.timeout(90000),
-          });
-        }
-
-        if (!openluxRes.ok) {
-          const errText = await openluxRes.text();
-          throw new Error(`OpenLux Gemini Gateway báo lỗi (${openluxRes.status}): ${errText.slice(0, 200)}`);
-        }
-
-        const openluxData: any = await openluxRes.json();
-        if (openluxData?.candidates?.[0]?.content?.parts) {
-          for (const part of openluxData.candidates[0].content.parts) {
-            if (part.text && !part.thought) {
-              responseText += part.text;
-            }
-          }
-        }
       } else {
-        console.log(`📡 [Analyze Script] Gọi Google GenAI Official SDK (${targetModel})...`);
-        const client = new GoogleGenAI({
-          apiKey: apiKey.trim(),
-          httpOptions: { headers: { "User-Agent": "aistudio-build" } },
-        });
+        prompt = `
+Bạn là một Chuyên Gia Giám Định Sản Phẩm & Đạo Diễn Video Quảng Cáo POD (Print-on-Demand) / Quà tặng quốc tế.
 
-        const contents: any[] = [];
-        if (imagePart) contents.push(imagePart);
-        contents.push(prompt);
+${podAdaptiveSceneKnowledge}
 
-        let geminiResponse;
-        try {
-          geminiResponse = await client.models.generateContent({
-            model: "gemini-3.7-flash",
-            contents: contents as any,
-          });
-        } catch (mErr: any) {
-          console.warn("⚠️ Không thể gọi gemini-3.7-flash với Google SDK, thử fallback gemini-2.5-flash:", mErr?.message);
-          geminiResponse = await client.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: contents as any,
-          });
-        }
+THÔNG TIN SẢN PHẨM TỪ WEBSITE:
+- Tên sản phẩm: ${title || "Sản phẩm"}
+- Mô tả sản phẩm: ${description || "Không có mô tả"}
+- Ảnh sản phẩm tham chiếu: ${imagePart ? "[Đã đính kèm ảnh chụp thực tế để kiểm tra trực quan]" : "Dựa trên mô tả và tên"}
 
-        responseText = geminiResponse.text || "";
+YÊU CẦU:
+1. Phân tích chi tiết đặc tính vật lý (Tên, Chất liệu, Hình dáng chuẩn xác, Kích thước thật, Họa tiết in ấn, Phụ kiện).
+2. Tự động đề xuất 4-5 phân cảnh hoàn toàn phù hợp và linh hoạt riêng cho thể loại sản phẩm này (Vertical 9:16, mỗi cảnh đúng 5s, quay oneshot).
+3. ĐƯA TOÀN BỘ ĐẶC TÍNH VẬT LÝ VÀO TỪNG imagePrompt và videoPrompt, TUÂN THỦ: Tone ảnh iPhone chân thực, Không nhựa, Không sáp bóng AI, Single oneshot video không cắt cảnh, Không lơ lửng, Không tự xoay, Tốc độ tự nhiên 1.0x đời thực, Không slow motion, Họa tiết in 100% sắc nét rõ ràng.
+
+Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc:
+{
+  "productSpecs": {
+    "productName": "Tên và loại sản phẩm chuẩn xác",
+    "category": "Thể loại sản phẩm",
+    "material": "Chất liệu cụ thể và đặc tính bề mặt",
+    "shape": "Hình dạng hình học chính xác (chống biến dạng 2D/3D)",
+    "dimensions": "Kích thước & tỷ lệ vật lý thật trong đời sống",
+    "designDetails": "Chi tiết họa tiết in ấn, hình ảnh, typography và màu sắc",
+    "finish": "Độ bóng, độ trong suốt, phụ kiện đi kèm",
+    "keyFeatures": "Điểm nhấn nổi bật",
+    "promptSnippet": "English physical specs snippet"
+  },
+  "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm",
+  "adConcept": "Ý tưởng kịch bản thị giác tùy biến riêng cho sản phẩm này",
+  "scriptTitle": "Tiêu đề video quảng cáo",
+  "scenes": [
+    {
+      "sceneNumber": 1,
+      "sceneType": "Tên thể loại cảnh tự đề xuất",
+      "title": "Cảnh 1: Tiêu đề cảnh",
+      "visualDescription": "Mô tả khung hình thị giác dọc 9:16 chân thực...",
+      "productFocus": "Góc máy đặc tả sản phẩm...",
+      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ... shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, crisp typography, photorealistic 8k",
+      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of ..., single continuous take without cuts, standard 1.0x real-time speed, stationary static product unless held by hand, strictly no self-rotation, no floating, strictly no slow motion, 4k",
+      "cameraMotion": "handheld",
+      "duration": "5"
+    }
+  ]
+}
+`;
       }
 
-      // Clean potential JSON markdown blocks ```json ... ```
+      const responseText = await callGeminiVisionText(apiKey, prompt, imagePart, visionConfig, model);
       let jsonString = responseText.replace(/```json/gi, "").replace(/```/g, "").trim();
 
       let parsedScript;
@@ -693,11 +890,19 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
           pngBuf = rawBuf;
         }
 
-        const podImagePrompt = `Vertical 9:16 commercial advertisement photograph. CRITICAL POD DIRECTIVE: You MUST preserve and prominently showcase 100% of the custom printed artwork, typography, text, illustrations, and graphic design from the reference product image. The printed design must be tack-sharp, in pristine focus, completely legible and vibrant. Authentic photorealistic photography, genuine physical material texture (crystal clear glass reflections, realistic ceramic glaze, natural fabric weave), natural ambient lighting, soft blurred lifestyle background, authentic and realistic, 8k resolution, zero blur or distortion on the product artwork. Scene details: ${prompt}`;
+        const strictFidelityDirective = `[CRITICAL PRODUCT REPRODUCTION & IPHONE SNAPSHOT REALISM DIRECTIVE]:
+You MUST reproduce the product EXACTLY as shown in the provided reference image with authentic iPhone camera snapshot realism.
+1. IPHONE REALISM & NATURAL TONES: Shot on iPhone 15 Pro mobile camera (24mm/48mm lens), candid smartphone photography style, raw unedited mobile photo, natural diffused daylight, true-to-life organic colors and accurate white balance. ABSOLUTELY NO plastic sheen, NO waxy AI skin, NO 3D CGI render, NO oversaturated digital artwork.
+2. HUMAN ANATOMY & SKIN: Human hands and skin must be completely photorealistic with visible natural microscopic skin pores, subtle skin texture, natural authentic skin tone, and anatomically correct 5 fingers (ABSOLUTELY NO deformed fingers or plastic smoothing).
+3. PRINTED ARTWORK & TYPOGRAPHY: Every single graphic element, printed illustration, typography, letters, font style, and colors must match the reference product 100%. The printed design must be in tack-sharp focus, pristine, 100% legible, and distortion-free.
+4. GEOMETRY & MATERIALS: Maintain the identical physical shape, profile, and proportions of the product from the reference image (disc stays flat disc, mug stays cylinder, etc.). Authentic real-world physical material behavior (ceramic glaze, glass transparency, metal sheen, fabric weave).
+5. GROUNDED REALISM: The product must be firmly and naturally held in hand with real grip gravity or resting securely on a table/box surface with realistic contact shadows (ZERO floating in mid-air).
+
+Specific scene layout and action: ${prompt}`;
 
         const formData = new FormData();
         formData.append("image", new Blob([new Uint8Array(pngBuf)], { type: "image/png" }), "reference_product.png");
-        formData.append("prompt", podImagePrompt);
+        formData.append("prompt", strictFidelityDirective);
         formData.append("model", gptImageConfig?.model || "gpt-image-2");
         formData.append("size", "1152x2048");
         formData.append("response_format", "b64_json");
@@ -744,15 +949,23 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
         });
 
         const targetModel = "gemini-3.1-flash-image";
-        const podGeminiPrompt = `Create a vertical 9:16 cinematic commercial advertisement photograph of this Print-On-Demand product. CRITICAL DIRECTIVE: You MUST preserve and highlight 100% of the custom printed design, artwork, typography, and graphics from the reference image. The printed design must be tack-sharp, completely in focus, and crystal-clear. Natural, authentic commercial lighting, genuine physical texture (realistic glass/ceramic/fabric), cozy natural lifestyle setting with soft background blur. Scene: ${prompt}. Aspect ratio: 9:16. 8k photorealistic resolution.`;
+        const strictFidelityDirective = `[CRITICAL PRODUCT REPRODUCTION & IPHONE SNAPSHOT REALISM DIRECTIVE]:
+You MUST reproduce the product EXACTLY as shown in the provided reference image with authentic iPhone camera snapshot realism.
+1. IPHONE REALISM & NATURAL TONES: Shot on iPhone 15 Pro mobile camera (24mm/48mm lens), candid smartphone photography style, raw unedited mobile photo, natural diffused daylight, true-to-life organic colors and accurate white balance. ABSOLUTELY NO plastic sheen, NO waxy AI skin, NO 3D CGI render, NO oversaturated digital artwork.
+2. HUMAN ANATOMY & SKIN: Human hands and skin must be completely photorealistic with visible natural microscopic skin pores, subtle skin texture, natural authentic skin tone, and anatomically correct 5 fingers (ABSOLUTELY NO deformed fingers or plastic smoothing).
+3. PRINTED ARTWORK & TYPOGRAPHY: Every single graphic element, printed illustration, typography, letters, font style, and colors must match the reference product 100%. The printed design must be in tack-sharp focus, pristine, 100% legible, and distortion-free.
+4. GEOMETRY & MATERIALS: Maintain the identical physical shape, profile, and proportions of the product from the reference image (disc stays flat disc, mug stays cylinder, etc.). Authentic real-world physical material behavior (ceramic glaze, glass transparency, metal sheen, fabric weave).
+5. GROUNDED REALISM: The product must be firmly and naturally held in hand with real grip gravity or resting securely on a table/box surface with realistic contact shadows (ZERO floating in mid-air).
+
+Specific scene layout and action: ${prompt}`;
 
         const response = await client.models.generateContent({
           model: targetModel,
           contents: {
             parts: [
-              { text: "[REFERENCE PRODUCT IMAGE]\nThis is the authentic Print-On-Demand product reference. The generated scene must prominently feature this exact product with its genuine printed design, artwork, text, colors, and textures completely preserved and in sharp focus." },
+              { text: "[PRIMARY PRODUCT REFERENCE - MUST PRESERVE IDENTICAL GEOMETRY, ARTWORK, TEXT, AND MATERIALS]:\nBelow is the authentic reference product. The final commercial photograph must feature this exact item with 100% fidelity to its shape, custom printed graphic design, typography, and material texture." },
               { inlineData: { mimeType: mimeType || "image/jpeg", data: base64Data } },
-              { text: podGeminiPrompt },
+              { text: strictFidelityDirective },
             ] as any,
           },
           config: {
@@ -1600,10 +1813,16 @@ IMPORTANT RULES:
         }
       }
 
-      const defaultNegativePrompt = "";
+      const baseAntiArtifactNegative =
+        "self-rotating object, autonomous object spinning, floating in air, levitation, phantom movement, object moving without human hands, spontaneous lifting, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, morphing, warping, artificial slow motion, blurry details, distorted logo, distorted text, low quality";
+
+      const finalNegativePrompt =
+        negative_prompt && typeof negative_prompt === "string" && !negative_prompt.includes("camera movement") && negative_prompt.trim().length > 0
+          ? `${negative_prompt.trim()}, ${baseAntiArtifactNegative}`
+          : baseAntiArtifactNegative;
 
       const defaultPrompt =
-        "The model poses naturally and gracefully with subtle gentle breathing movements, keeping the product design, clothing prints, patterns, logos and apparel structure completely fixed and unchanged. Highly detailed, 4k photorealistic cinematic lighting.";
+        "Vertical 9:16 authentic smartphone UGC commercial video. The model interacts naturally with standard 1.0x real-time speed, keeping the product design, prints, and structure completely fixed and unchanged. Shot on mobile phone camera, natural physics and gravity, 4k photorealistic.";
 
       // Build payload matching exact Kling AI image2video specification
       // NOTE: Kling AI API requires mode: "pro" when image_tail (end frame) is used.
@@ -1615,10 +1834,7 @@ IMPORTANT RULES:
         multi_shot: Boolean(multi_shot),
         image: formattedImage,
         prompt: (prompt && prompt.trim()) || defaultPrompt,
-        negative_prompt:
-          negative_prompt && typeof negative_prompt === "string" && !negative_prompt.includes("camera movement")
-            ? negative_prompt.trim()
-            : defaultNegativePrompt,
+        negative_prompt: finalNegativePrompt,
         cfg_scale: typeof cfg_scale === "number" ? cfg_scale : Number(cfg_scale) || 0.6,
         watermark_info:
           watermark_info && typeof watermark_info === "object"
@@ -1786,6 +2002,442 @@ IMPORTANT RULES:
       return res.status(500).json({
         error: err?.message || "Lỗi khi kiểm tra tiến trình video Kling.",
       });
+    }
+  });
+
+  // In-memory / file cache for merged videos
+  const mergedVideosCache = new Map<string, { filePath: string; createdAt: number; mimeType: string; duration?: number }>();
+
+  // Periodically clean up merged video files older than 12 hours
+  setInterval(() => {
+    const cutoff = Date.now() - 12 * 60 * 60 * 1000;
+    for (const [id, item] of mergedVideosCache.entries()) {
+      if (item.createdAt < cutoff) {
+        try {
+          if (fs.existsSync(item.filePath)) fs.unlinkSync(item.filePath);
+        } catch (_) {}
+        mergedVideosCache.delete(id);
+      }
+    }
+  }, 30 * 60 * 1000);
+
+  // Helper to query video clip duration using ffprobe
+  async function getClipDurationSeconds(filePath: string): Promise<number> {
+    return new Promise((resolve) => {
+      const proc = spawn(
+        "ffprobe",
+        [
+          "-v",
+          "error",
+          "-show_entries",
+          "format=duration",
+          "-of",
+          "default=noprint_wrappers=1:nokey=1",
+          filePath,
+        ],
+        { windowsHide: true }
+      );
+      let stdout = "";
+      proc.stdout?.on("data", (d) => {
+        stdout += d.toString();
+      });
+      proc.on("close", (code) => {
+        const dur = parseFloat(stdout.trim());
+        if (code === 0 && !isNaN(dur) && dur > 0) {
+          resolve(dur);
+        } else {
+          resolve(5.0); // Default Kling video duration
+        }
+      });
+      proc.on("error", () => resolve(5.0));
+    });
+  }
+
+  // AI-Driven Transition Analyzer: Decides optimal cinematic transition (cut, crossfade, slide, wipe, zoom) for each cut
+  async function analyzeTransitionsWithAI(params: {
+    scenesCount: number;
+    scenes?: Array<{ prompt?: string; purpose?: string; cameraMotion?: string }>;
+    transitionMode?: "auto" | "cut" | "crossfade" | "fadeblack" | "none";
+    apiKey?: string;
+    visionConfig?: any;
+    model?: string;
+  }): Promise<Array<{ fromIndex: number; toIndex: number; transition: string; duration: number; reason: string }>> {
+    const { scenesCount, scenes = [], transitionMode = "auto", apiKey, visionConfig, model } = params;
+    const count = scenesCount - 1;
+    if (count <= 0) return [];
+
+    // Mode 1: Explicit Hard Cut (Cắt thẳng dứt khoát 100% không giật hình)
+    if (transitionMode === "cut" || transitionMode === "none") {
+      return Array.from({ length: count }, (_, idx) => ({
+        fromIndex: idx,
+        toIndex: idx + 1,
+        transition: "none",
+        duration: 0,
+        reason: "Cắt trực diện không hiệu ứng (Hard Cut) để giữ nhịp dứt khoát, mượt mà và không giật hình.",
+      }));
+    }
+
+    // Mode 2: Explicit Crossfade (Hòa tan mềm mại 0.35s)
+    if (transitionMode === "crossfade") {
+      return Array.from({ length: count }, (_, idx) => ({
+        fromIndex: idx,
+        toIndex: idx + 1,
+        transition: "fade",
+        duration: 0.35,
+        reason: "Hòa tan mềm mại (Cross Dissolve) êm mắt, chuyển cảnh nhẹ nhàng.",
+      }));
+    }
+
+    // Mode 3: Explicit Dip to Black (Nháy tối điện ảnh 0.35s)
+    if (transitionMode === "fadeblack") {
+      return Array.from({ length: count }, (_, idx) => ({
+        fromIndex: idx,
+        toIndex: idx + 1,
+        transition: "fadeblack",
+        duration: 0.35,
+        reason: "Chuyển tiếp nháy tối điện ảnh (Dip to Black) thanh lịch.",
+      }));
+    }
+
+    // Mode 4: AI Intelligent Auto Transition Analysis (TUYỆT ĐỐI KHÔNG DÙNG PAN/SLIDE/WIPE TRÁNH GIẬT KHUNG HÌNH)
+    try {
+      const scenesContext = scenes
+        .map(
+          (sc, idx) =>
+            `Phân cảnh ${idx + 1}: ${sc.purpose || "Quảng cáo sản phẩm"} - Mô tả: "${sc.prompt || ""}" - Chuyển động: ${sc.cameraMotion || "zoom_in"}`
+        )
+        .join("\n");
+
+      const prompt = `Bạn là Đạo diễn Hậu kỳ Video Quảng cáo chuyên nghiệp (Commercial Video Editor).
+Dưới đây là chuỗi ${scenesCount} phân cảnh video quảng cáo thương mại 9:16:
+${scenesContext}
+
+YÊU CẦU: Hãy phân tích mạch cảm xúc và nhịp độ giữa từng cặp phân cảnh liền kề để lựa chọn hiệu ứng chuyển cảnh mềm mại hoặc CẮT THẲNG (tổng cộng ${count} điểm chuyển cảnh).
+LƯU Ý ĐẶC BIỆT: TUYỆT ĐỐI KHÔNG DÙNG HIỆU ỨNG PAN / SLIDE / WIPE (trượt ngang/gạt hình) vì sẽ làm giật và rách khung hình.
+
+CHỈ ĐƯỢC CHỌN 1 TRONG 3 KIỂU CHUYỂN CẢNH SAU:
+- "none" (Cắt dứt khoát / Hard Cut): Giữ nhịp nhanh, dứt khoát, hoàn hảo từ cảnh Hook mở đầu sang chi tiết sản phẩm. Thời lượng: 0s.
+- "fade" (Hòa tan mềm mại / Crossfade 0.35s): Chuyển tiếp êm dịu, mượt mà giữa các cảnh sinh hoạt và trải nghiệm thực tế.
+- "fadeblack" (Nháy tối điện ảnh / Dip to Black 0.35s): Chuyển tiếp mờ tối sang cảnh kế tiếp hoặc cảnh kêu gọi hành động CTA chốt đơn.
+
+Hãy trả về DUY NHẤT một mảng JSON gồm chính xác ${count} phần tử với định dạng:
+[
+  {
+    "fromIndex": 0,
+    "toIndex": 1,
+    "transition": "none" | "fade" | "fadeblack",
+    "duration": 0 hoặc 0.35,
+    "reason": "Giải thích ngắn gọn 1 câu bằng tiếng Việt lý do chọn hiệu ứng này"
+  }
+]`;
+
+      const aiText = await callGeminiVisionText(apiKey, prompt, undefined, visionConfig, model || "gemini-3.7-flash");
+      const cleanJson = aiText.replace(/```json/gi, "").replace(/```/g, "").trim();
+      const parsed = JSON.parse(cleanJson);
+      if (Array.isArray(parsed) && parsed.length === count) {
+        console.log(`🤖 [AI Transition Analyzer] Đã phân tích thành công ${parsed.length} điểm chuyển cảnh thông minh.`);
+        return parsed.map((item, idx) => {
+          let trans = typeof item.transition === "string" ? item.transition.toLowerCase() : "fade";
+          // Sanitize: enforce no pan/slide
+          if (trans.includes("slide") || trans.includes("wipe") || trans.includes("zoom")) {
+            trans = "fade";
+          }
+          return {
+            fromIndex: idx,
+            toIndex: idx + 1,
+            transition: trans === "none" ? "none" : trans === "fadeblack" ? "fadeblack" : "fade",
+            duration: trans === "none" ? 0 : 0.35,
+            reason: item.reason || "AI tự động tối ưu hóa nhịp phim mượt mà không giật",
+          };
+        });
+      }
+    } catch (aiErr: any) {
+      console.warn("⚠️ [AI Transition Analyzer] AI phân tích thất bại, dùng bộ quy tắc thích ứng dự phòng:", aiErr?.message);
+    }
+
+    // Rule-based heuristic fallback (100% smooth without pan/slide jitter):
+    // Scene 1 -> 2: Hard Cut (clean, fast)
+    // Scene 2 -> 3: Crossfade (smooth 0.35s)
+    // Scene 3 -> 4: Crossfade (smooth 0.35s)
+    // Scene 4 -> 5: Dip to black / Crossfade (0.35s)
+    return Array.from({ length: count }, (_, idx) => {
+      if (idx === 0) {
+        return {
+          fromIndex: 0,
+          toIndex: 1,
+          transition: "none",
+          duration: 0,
+          reason: "Cắt trực diện (Hard Cut) dứt khoát từ cảnh Hook mở đầu sang chi tiết mở hộp không giật khung hình.",
+        };
+      } else if (idx === count - 1) {
+        return {
+          fromIndex: idx,
+          toIndex: idx + 1,
+          transition: "fadeblack",
+          duration: 0.35,
+          reason: "Nháy tối điện ảnh (Dip to Black) êm mắt trước khi chuyển sang cảnh kết thúc kêu gọi hành động CTA.",
+        };
+      } else {
+        return {
+          fromIndex: idx,
+          toIndex: idx + 1,
+          transition: "fade",
+          duration: 0.35,
+          reason: "Hòa tan mềm mại (Crossfade 0.35s) êm dịu, không giật hình khi chuyển tiếp giữa các bối cảnh đời thường.",
+        };
+      }
+    });
+  }
+
+  // Endpoint to merge multiple scene video URLs into 1 complete video using FFmpeg & AI Smart Transitions
+  app.post("/api/video/merge-scenes", async (req, res) => {
+    try {
+      const {
+        videoUrls,
+        scenes,
+        transitionMode = "auto",
+        customTransitions,
+        aspectRatio = "9:16",
+        apiKey,
+        visionConfig,
+      } = req.body;
+
+      if (!Array.isArray(videoUrls) || videoUrls.length === 0) {
+        return res.status(400).json({ error: "Danh sách videoUrls không được để trống" });
+      }
+
+      const validUrls = videoUrls.filter((u) => typeof u === "string" && u.trim().length > 0);
+      if (validUrls.length === 0) {
+        return res.status(400).json({ error: "Không tìm thấy URL video hợp lệ để ghép" });
+      }
+
+      console.log(`🎬 [FFmpeg Video Merger] Bắt đầu xử lý ghép ${validUrls.length} phân cảnh (Chế độ chuyển cảnh: ${transitionMode})...`);
+
+      const tempDir = path.join(os.tmpdir(), `merge_video_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+      fs.mkdirSync(tempDir, { recursive: true });
+
+      // Step 1: Download or copy each video clip
+      const downloadedFiles: string[] = [];
+      for (let i = 0; i < validUrls.length; i++) {
+        const rawUrl = validUrls[i].trim();
+        const clipPath = path.join(tempDir, `clip_${i}.mp4`);
+
+        // Check if local file exists on disk
+        const localPathCandidate = path.isAbsolute(rawUrl) ? rawUrl : path.join(process.cwd(), rawUrl);
+        if (fs.existsSync(localPathCandidate) && fs.statSync(localPathCandidate).isFile()) {
+          console.log(`📁 [FFmpeg Merger] Dùng file video cục bộ ${i + 1}/${validUrls.length}: ${localPathCandidate}`);
+          fs.copyFileSync(localPathCandidate, clipPath);
+          downloadedFiles.push(clipPath);
+          continue;
+        }
+
+        let targetUrl = rawUrl;
+        if (targetUrl.startsWith("/")) {
+          targetUrl = `http://localhost:${PORT}${targetUrl}`;
+        }
+
+        console.log(`📥 [FFmpeg Merger] Đang tải clip ${i + 1}/${validUrls.length}: ${targetUrl.slice(0, 80)}...`);
+        const fetchRes = await fetch(targetUrl, {
+          redirect: "follow",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+          },
+        });
+
+        if (!fetchRes.ok) {
+          throw new Error(`Không thể tải video phân cảnh ${i + 1} (${fetchRes.status} ${fetchRes.statusText})`);
+        }
+
+        const arrayBuf = await fetchRes.arrayBuffer();
+        fs.writeFileSync(clipPath, Buffer.from(arrayBuf));
+        downloadedFiles.push(clipPath);
+      }
+
+      // Step 2: Query exact duration of each clip with ffprobe
+      const clipDurations: number[] = [];
+      for (let i = 0; i < downloadedFiles.length; i++) {
+        const dur = await getClipDurationSeconds(downloadedFiles[i]);
+        clipDurations.push(dur);
+        console.log(`⏱️ Clip ${i + 1} duration: ${dur.toFixed(2)}s`);
+      }
+
+      // Step 3: AI Transition Decision
+      let chosenTransitions: Array<{
+        fromIndex: number;
+        toIndex: number;
+        transition: string;
+        duration: number;
+        reason: string;
+      }> = [];
+
+      if (Array.isArray(customTransitions) && customTransitions.length === downloadedFiles.length - 1) {
+        chosenTransitions = customTransitions;
+      } else {
+        chosenTransitions = await analyzeTransitionsWithAI({
+          scenesCount: downloadedFiles.length,
+          scenes: Array.isArray(scenes) ? scenes : undefined,
+          transitionMode,
+          apiKey,
+          visionConfig,
+        });
+      }
+
+      // Step 4: Build FFmpeg command with xfade filter chain
+      const outputFilename = `final_video_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`;
+      const outputPath = path.join(tempDir, outputFilename);
+
+      const width = aspectRatio === "16:9" ? 1920 : aspectRatio === "1:1" ? 1080 : 1080;
+      const height = aspectRatio === "16:9" ? 1080 : aspectRatio === "1:1" ? 1080 : 1920;
+
+      // Normalize inputs: scale, pad, fps=30, setsar=1
+      const normalizedInputs = downloadedFiles
+        .map(
+          (_, idx) =>
+            `[${idx}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v${idx}];`
+        )
+        .join("");
+
+      // Check if all transitions are hard cut or transitionMode is cut
+      const isPureCut = transitionMode === "cut" || chosenTransitions.every((t) => t.transition === "none" || t.duration <= 0);
+
+      let filterComplex = "";
+      if (isPureCut) {
+        // Simple and 100% robust hard cut stream concatenation
+        const concatStreams = downloadedFiles.map((_, idx) => `[v${idx}]`).join("");
+        filterComplex = `${normalizedInputs}${concatStreams}concat=n=${downloadedFiles.length}:v=1:a=0[outv]`;
+      } else {
+        // Chained xfade filter graph with frame-safe duration and offsets
+        let currentStream = `[v0]`;
+        let accumulatedTime = clipDurations[0];
+        const filterSteps: string[] = [];
+
+        for (let i = 0; i < downloadedFiles.length - 1; i++) {
+          const tr = chosenTransitions[i] || { transition: "fade", duration: 0.35 };
+          const nextStream = `[v${i + 1}]`;
+          const outStream = i === downloadedFiles.length - 2 ? `[outv]` : `[v_xf_${i}]`;
+          
+          const isCut = tr.transition === "none" || tr.duration <= 0;
+          const transType = isCut ? "fade" : tr.transition;
+          const transDur = isCut ? 0.15 : Math.min(Math.max(tr.duration, 0.2), 0.5);
+          
+          // Ensure offset strictly satisfies: offset + transDur <= accumulatedTime
+          const maxAllowedOffset = Math.max(0.1, accumulatedTime - transDur);
+          const offset = maxAllowedOffset;
+
+          filterSteps.push(
+            `${currentStream}${nextStream}xfade=transition=${transType}:duration=${transDur.toFixed(
+              3
+            )}:offset=${offset.toFixed(3)}${outStream}`
+          );
+          accumulatedTime = accumulatedTime + clipDurations[i + 1] - transDur;
+          currentStream = outStream;
+        }
+
+        filterComplex = `${normalizedInputs}${filterSteps.join(";")}`;
+      }
+
+      const ffmpegArgs = [
+        "-y",
+        ...downloadedFiles.flatMap((f) => ["-i", f]),
+        "-filter_complex",
+        filterComplex,
+        "-map",
+        "[outv]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        outputPath,
+      ];
+
+      console.log(`⚙️ [FFmpeg Merger] Thực thi lệnh: ffmpeg ${ffmpegArgs.join(" ")}`);
+
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn("ffmpeg", ffmpegArgs, { windowsHide: true });
+        let stderr = "";
+        proc.stderr?.on("data", (d) => {
+          stderr += d.toString();
+        });
+        proc.on("close", (code) => {
+          if (code === 0 && fs.existsSync(outputPath)) {
+            resolve();
+          } else {
+            console.error("FFmpeg error log:", stderr.slice(-1000));
+            reject(new Error(`Lỗi FFmpeg khi ghép video (Mã lỗi: ${code}). ${stderr.slice(-300)}`));
+          }
+        });
+        proc.on("error", (err) => {
+          reject(err);
+        });
+      });
+
+      const mergedId = `merged_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      mergedVideosCache.set(mergedId, {
+        filePath: outputPath,
+        createdAt: Date.now(),
+        mimeType: "video/mp4",
+      });
+
+      const mergedVideoUrl = `/api/video/merged/${mergedId}.mp4`;
+      console.log(`✅ [FFmpeg Merger] Ghép video thành công! (${mergedVideoUrl})`);
+
+      return res.json({
+        success: true,
+        mergedId,
+        videoUrl: mergedVideoUrl,
+        clipsCount: downloadedFiles.length,
+        transitions: chosenTransitions,
+        message: `Đã ghép thành công ${downloadedFiles.length} phân cảnh thành 1 video hoàn chỉnh với chuyển cảnh thông minh!`,
+      });
+    } catch (err: any) {
+      console.error("❌ [FFmpeg Video Merge Error]:", err);
+      return res.status(500).json({
+        error: err?.message || "Lỗi khi ghép video bằng FFmpeg",
+      });
+    }
+  });
+
+  // Serve merged video file with streaming range support
+  app.get("/api/video/merged/:id", (req, res) => {
+    const rawId = req.params.id.replace(/\.[a-zA-Z0-9]+$/, "");
+    const item = mergedVideosCache.get(rawId) || mergedVideosCache.get(req.params.id);
+    if (!item || !fs.existsSync(item.filePath)) {
+      return res.status(404).send("Video đã ghép không tồn tại hoặc đã bị dọn dẹp.");
+    }
+
+    const stat = fs.statSync(item.filePath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunksize = end - start + 1;
+      const file = fs.createReadStream(item.filePath, { start, end });
+      const head = {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunksize,
+        "Content-Type": "video/mp4",
+      };
+      res.writeHead(206, head);
+      file.pipe(res);
+    } else {
+      const head = {
+        "Content-Length": fileSize,
+        "Content-Type": "video/mp4",
+        "Accept-Ranges": "bytes",
+      };
+      res.writeHead(200, head);
+      fs.createReadStream(item.filePath).pipe(res);
     }
   });
 
