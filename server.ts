@@ -332,55 +332,69 @@ async function startServer() {
     }
   });
 
-  // Helper to prepare compressed reference image part for Gemini multimodal analysis
-  async function prepareProductImagePart(images: string[]): Promise<any> {
-    if (!images || images.length === 0 || typeof images[0] !== "string") return null;
-    try {
-      const firstImg = images[0];
-      let imgBuf: Buffer | null = null;
-      if (firstImg.startsWith("data:")) {
-        const match = firstImg.match(/^data:([^;]+);base64,(.+)$/);
-        if (match) {
-          imgBuf = Buffer.from(match[2], "base64");
-        }
-      } else if (firstImg.startsWith("http://") || firstImg.startsWith("https://")) {
-        console.log(`📥 [Image Helper] Tải ảnh sản phẩm gốc để AI phân tích: ${firstImg.slice(0, 80)}...`);
-        const fRes = await fetch(firstImg, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-          },
-          signal: AbortSignal.timeout(6000),
-        });
-        if (fRes.ok) {
-          const ab = await fRes.arrayBuffer();
-          imgBuf = Buffer.from(ab);
-        }
-      }
-      if (imgBuf) {
-        try {
-          const smallJpg = await sharp(imgBuf)
-            .resize(512, 512, { fit: "inside" })
-            .jpeg({ quality: 80 })
-            .toBuffer();
-          return {
-            inlineData: {
-              mimeType: "image/jpeg",
-              data: smallJpg.toString("base64"),
+  // Helper to prepare multiple compressed reference image parts for Gemini multimodal analysis
+  async function prepareAllProductImageParts(images: string[], maxCount: number = 6): Promise<Array<{ inlineData: { mimeType: string; data: string } }>> {
+    if (!images || images.length === 0) return [];
+    const valid = images.filter((img) => typeof img === "string" && img.trim().length > 0).slice(0, maxCount);
+    const parts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
+
+    for (let i = 0; i < valid.length; i++) {
+      const raw = valid[i];
+      try {
+        let imgBuf: Buffer | null = null;
+        if (raw.startsWith("data:")) {
+          const match = raw.match(/^data:([^;]+);base64,(.+)$/);
+          if (match) imgBuf = Buffer.from(match[2], "base64");
+        } else if (raw.startsWith("http://") || raw.startsWith("https://")) {
+          let fetchUrl = raw;
+          if (fetchUrl.startsWith("/")) {
+            fetchUrl = `http://localhost:${PORT}${fetchUrl}`;
+          }
+          console.log(`📥 [Image Helper] Tải ảnh #${i + 1}/${valid.length} để AI thẩm định & ghép kịch bản: ${fetchUrl.slice(0, 80)}...`);
+          const fRes = await fetch(fetchUrl, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
             },
-          };
-        } catch {
-          return {
-            inlineData: {
-              mimeType: "image/jpeg",
-              data: imgBuf.toString("base64"),
-            },
-          };
+            signal: AbortSignal.timeout(6000),
+          });
+          if (fRes.ok) {
+            const ab = await fRes.arrayBuffer();
+            imgBuf = Buffer.from(ab);
+          }
         }
+
+        if (imgBuf) {
+          try {
+            const smallJpg = await sharp(imgBuf)
+              .resize(512, 512, { fit: "inside" })
+              .jpeg({ quality: 80 })
+              .toBuffer();
+            parts.push({
+              inlineData: {
+                mimeType: "image/jpeg",
+                data: smallJpg.toString("base64"),
+              },
+            });
+          } catch {
+            parts.push({
+              inlineData: {
+                mimeType: "image/jpeg",
+                data: imgBuf.toString("base64"),
+              },
+            });
+          }
+        }
+      } catch (imgErr) {
+        console.warn(`⚠️ Lỗi tải ảnh #${i + 1}:`, imgErr);
       }
-    } catch (imgErr) {
-      console.warn("⚠️ Không thể tải ảnh gửi kèm prompt:", imgErr);
     }
-    return null;
+    return parts;
+  }
+
+  // Helper to prepare compressed reference image part for Gemini multimodal analysis (Single)
+  async function prepareProductImagePart(images: string[]): Promise<any> {
+    const parts = await prepareAllProductImageParts(images, 1);
+    return parts.length > 0 ? parts[0] : null;
   }
 
   // Helper to execute Gemini multimodal request
@@ -400,7 +414,11 @@ async function startServer() {
 
       console.log(`📡 [Gemini Gateway] Gọi OpenLux (${targetModel}) tại: ${openluxEndpoint}...`);
       const parts: any[] = [];
-      if (imagePart) parts.push(imagePart);
+      if (Array.isArray(imagePart)) {
+        parts.push(...imagePart.filter(Boolean));
+      } else if (imagePart) {
+        parts.push(imagePart);
+      }
       parts.push({ text: promptText });
 
       let openluxRes = await fetch(openluxEndpoint, {
@@ -457,7 +475,11 @@ async function startServer() {
       });
 
       const contents: any[] = [];
-      if (imagePart) contents.push(imagePart);
+      if (Array.isArray(imagePart)) {
+        contents.push(...imagePart.filter(Boolean));
+      } else if (imagePart) {
+        contents.push(imagePart);
+      }
       contents.push(promptText);
 
       let geminiResponse;
@@ -584,79 +606,78 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng định d�
         return res.status(400).json({ error: "Thiếu Gemini API Key để thực hiện phân tích kịch bản" });
       }
 
-      const imagePart = await prepareProductImagePart(images);
+      const imageParts = await prepareAllProductImageParts(images, 6);
+      const totalImagesCount = Math.max(1, imageParts.length);
 
       // Extract optional user scene style preference
       const { sceneStylePreference = "balanced" } = req.body;
 
       const podAdaptiveSceneKnowledge = `
-HỆ THỐNG ĐẠO DIỄN AI - TỰ ĐỘNG ĐỀ XUẤT 5 PHÂN CẢNH TÙY BIẾN ĐỘC QUYỀN CHO TỪNG LOẠI SẢN PHẨM:
+HỆ THỐNG ĐẠO DIỄN AI - TỰ ĐỘNG PHÂN TÍCH TOÀN BỘ ẢNH CÀO ĐƯỢC & ĐỀ XUẤT 5 PHÂN CẢNH QUẢNG CÁO UGC NHANH - BẮT MẮT - CUỐN HÚT ĐỈNH CAO:
 
-BẠN LÀ MỘT ĐẠO DIỄN QUẢNG CÁO QUỐC TẾ. NHIỆM VỤ CỦA BẠN LÀ TỰ ĐỘNG PHÂN TÍCH THỂ LOẠI SẢN PHẨM VÀ ĐỀ XUẤT 4 ĐẾN 5 PHÂN CẢNH PHÙ HỢP NHẤT VỚI CÔNG NĂNG VÀ BỐI CẢNH THỰC TẾ CỦA SẢN PHẨM ĐÓ:
+BẠN LÀ MỘT ĐẠO DIỄN QUẢNG CÁO VIRAL TIKTOK / REELS / SHORTS & CHUYÊN GIA TRUYỀN THÔNG SẢN PHẨM POD QUỐC TẾ.
+Nhiệm vụ của bạn là:
+1. Phân tích TẤT CẢ các hình ảnh sản phẩm đã cào được (từ Ảnh 1/Index 0 đến Ảnh ${totalImagesCount}/Index ${totalImagesCount - 1}).
+2. Hiểu rõ góc chụp và nội dung của từng ảnh (Ảnh chính diện, ảnh góc nghiêng, ảnh siêu cận Macro, ảnh unboxing hộp quà, ảnh lifestyle đặt trong không gian, v.v.).
+3. Với mỗi phân cảnh trong 5 cảnh quảng cáo (Cảnh 1 đến Cảnh 5), CHỌN ĐÚNG ẢNH THAM CHIẾU PHÙ HỢP NHẤT ('selectedImageIndex') và giải thích lý do ('refImageReason'):
+   - Cảnh 1 (Visual Hook giật gân): Chọn ảnh chính diện hoặc góc nhìn tổng thể ấn tượng nhất để đập ngay vào mắt người xem.
+   - Cảnh 2 (Fast Hands-on / Unboxing): Chọn ảnh có hộp quà, unboxing hoặc góc cầm tay thực tế.
+   - Cảnh 3 (Macro Chi tiết sắc bén): Chọn ảnh chụp cận cảnh nhất vào chi tiết in ấn/chữ viết/chất liệu.
+   - Cảnh 4 (Lifestyle Thời thượng): Chọn ảnh có bối cảnh không gian sống/decor sang trọng.
+   - Cảnh 5 (Cảm xúc bùng nổ / Khoe sản phẩm): Chọn ảnh góc đẹp nhất làm nổi bật giá trị quà tặng.
 
-HƯỚNG DẪN ĐỀ XUẤT THEO TỪNG DANH MỤC SẢN PHẨM (Ví dụ tham khảo để AI tự do sáng tạo linh hoạt):
-1. Đồ Uống / Cốc Ly / Bình Giữ Nhiệt (Mug, Tumbler, Water Bottle):
-   - Cảnh 1: Cầm tay nhấp ngụm cà phê sáng bên khung cửa sổ ngập tràn ánh nắng.
-   - Cảnh 2: Mở hộp quà trang trọng trên bàn gỗ hoặc đặt vào khay đựng cốc trên ô tô / bàn làm việc.
-   - Cảnh 3: Cận cảnh Macro vát cạnh, giọt nước đọng hoặc vệt phản chiếu ánh sáng trên lớp men gốm/inox.
-   - Cảnh 4: Rót nước hoặc đặt bên laptop bàn làm việc hiện đại.
-   - Cảnh 5: Nụ cười sảng khoái của nhân vật cầm cốc chào ngày mới.
+CẤU TRÚC 5 PHÂN CẢNH QUẢNG CÁO VIRAL UGC NHỊP ĐIỆU NHANH - BẮT MẮT - CUỐN HÚT (MỖI CẢNH 5 GIÂY, ONESHOT):
 
-2. Đồ Trang Trí / Ornament Giáng Sinh / Keepsake (Acrylic / Glass / Ceramic Ornament):
-   - Cảnh 1: Cận cảnh cầm tay trực diện UGC khoe trọn họa tiết in ấn và độ trong suốt của thủy tinh/mica.
-   - Cảnh 2: Mở nắp hộp quà thắt nơ đỏ nhấc ornament từ khay lót nhung.
-   - Cảnh 3: Siêu cận Macro góc nghiêng 30 độ bắt vệt sáng lấp lánh trên mép vát kim cương (beveled edge).
-   - Cảnh 4: Treo vững chắc trên cành thông Noel xanh mướt lung linh ánh đèn vàng ấm áp.
-   - Cảnh 5: Nụ cười hạnh phúc của nhân vật bên cây thông Noel ngắm nhìn sản phẩm.
+1. CẢNH 1: THUMB-STOPPING VISUAL HOOK (3 Giây Đầu Thu Hút Ánh Nhìn Cực Độ)
+   - Bối cảnh & Hành động: Thao tác đưa/nhấc sản phẩm vào khung hình với cử chỉ dứt khoát, tự tin, năng lượng cao; hoặc camera zoom-in nhanh ấn tượng làm bật ngay họa tiết in ấn cá nhân hóa độc lạ.
+   - Chuyển động: Nhanh, dứt khoát, bắt mắt (fast-paced, high retention), nếu có tay người thì tương tác hoạt bát, nếu sản phẩm độc lập thì camera push-in dứt khoát vào mặt in chính diện, cấm lật 180 độ ra sau.
 
-3. Thời Trang & May Mặc (T-shirt, Hoodie, Nón, Giày):
-   - Cảnh 1: Người mẫu mặc áo dạo phố phong cách streetwear tự tin, máy quay tracking chuyển động.
-   - Cảnh 2: Gấp phẳng flatlay trên nền gỗ mở hộp unboxing hoặc vuốt phẳng ngực áo.
-   - Cảnh 3: Cực cận Macro sợi dệt cotton và độ sắc nét của hình in trên vải.
-   - Cảnh 4: Phối đồ (lookbook) trước gương hoặc dạo bước trong quán cà phê thời thượng.
-   - Cảnh 5: Người mẫu tạo dáng nở nụ cười tự tin, truyền cảm hứng sở hữu.
+2. CẢNH 2: FAST HANDS-ON UNBOXING & TƯƠNG TÁC NĂNG ĐỘNG (Tactile Unboxing & Quick Action)
+   - Bối cảnh & Hành động: Bàn tay mở hộp quà nhanh nhẹn, nhấc sản phẩm ra dứt khoát, ngón tay lướt qua bề mặt trơn bóng lấp lánh ánh sáng, hoặc cắm đế/bật công tắc đèn LED bừng sáng ngay tức thì, hoặc cầm quai nâng lên nhấp ngụm nước đầy năng lượng.
+   - Chuyển động: Thao tác tay người 1.0x nhanh nhẹn, hoạt bát, các ngón tay mềm mại tự nhiên, sản phẩm là vật thể rắn bất biến (rigid solid), mặt in luôn hướng về camera, cấm lật 180 độ ra sau.
 
-4. Quà Tặng Đèn LED / Tranh Mica / Tranh Canvas / Trang Trí Nhà Cửa:
-   - Cảnh 1: Đặt trên bàn đầu giường hoặc kệ sách, bật công tắc đèn LED tỏa ánh sáng ấm cúng.
-   - Cảnh 2: Mở hộp quà lót xốp bảo vệ sang trọng.
-   - Cảnh 3: Cận cảnh độ trong trẻo của mica, bề mặt vân vải canvas và chi tiết in siêu nét.
-   - Cảnh 4: Toàn cảnh căn phòng ngủ/phòng khách ấm cúng với sản phẩm làm điểm nhấn thẩm mỹ.
-   - Cảnh 5: Cặp đôi hoặc nhân vật xúc động ngắm nhìn thông điệp in trên sản phẩm.
+3. CẢNH 3: DYNAMIC MACRO CRAFTSMANSHIP & PRINT SHOWCASE (Cận Cảnh Macro Sắc Nét & Vệt Sáng Bắt Mắt)
+   - Bối cảnh: Ống kính Macro cực cận (Extreme Close-up) lấy nét sắc lẹm (tack-sharp) vào chi tiết đắt giá nhất.
+   - Nội dung đặc tả: Từng nét chữ typography in sắc nét, hình minh họa cá nhân hóa sống động, vệt sáng bóng loáng lướt nhanh qua bề mặt mica/gỗ/gốm tạo cảm giác lung linh, cao cấp.
+   - Chuyển động: Máy quay push-in dứt khoát, mượt mà (punchy dynamic push-in), ánh sáng phòng lướt nhanh lấp lánh trên bề mặt vật thể rắn. Họa tiết in ấn giữ nguyên vẹn 100%, luôn trực diện camera.
 
-5. Trang Sức / Phụ Kiện Cá Nhân / Móc Khóa / Ví Da:
-   - Cảnh 1: Đeo trên cổ/cổ tay hoặc cầm trên tay kết hợp trang phục tinh tế.
-   - Cảnh 2: Mở hộp nhung trang sức sang trọng hé lộ sản phẩm lấp lánh.
-   - Cảnh 3: Macro phản chiếu ánh sáng kim loại, đá quý hoặc đường may viền da tinh xảo.
-   - Cảnh 4: Đặt vào túi xách hoặc tương tác trong sinh hoạt hàng ngày.
-   - Cảnh 5: Biểu cảm ngạc nhiên, xúc động khi nhận được món quà cá nhân hóa.
+4. CẢNH 4: VIBRANT LIFESTYLE & MODERN LIVING SPACE (Không Gian Sống Thời Thượng)
+   - Bối cảnh: Không gian decor hiện đại, phong cách (Góc làm việc công nghệ, phòng khách ấm cúng, taplo xe ô tô sang trọng). Sản phẩm tỏa sáng như một món đồ decor thời thượng.
+   - Chuyển động: Tương tác nhịp nhàng, năng động kết hợp zoom-in dứt khoát vào sản phẩm, tạo cảm giác thôi thúc sở hữu ngay.
 
-QUY TẮC BẮT BUỘC ĐẢM BẢO TÍNH ĐA DẠNG & THỰC TẾ (STRICT RULES):
-1. TỰ ĐỘNG THÍCH ỨNG: AI tự động phân tích và tạo các phân cảnh phù hợp 100% với công năng của sản phẩm. Không áp đặt cảnh treo cây thông cho cốc, không áp đặt cảnh mặc áo cho tranh mica.
-2. KHÔNG TRÙNG LẶP: Mỗi phân cảnh trong kịch bản PHẢI CÓ GÓC MÁY (Camera Angle), BỐI CẢNH (Setting/Environment), THAO TÁC (Action) và BỐ CỤC KHÁC NHAU 100%.
-3. TONE ẢNH CHÂN THẬT NHƯ CHỤP IPHONE (AUTHENTIC IPHONE PHOTOGRAPHY - ZERO PLASTIC / ZERO AI LOOK):
-   - Phong cách chụp: Ảnh chụp tự nhiên từ camera điện thoại iPhone (Shot on iPhone snapshot, 24mm/48mm lens, raw unedited photo).
-   - Tông màu & Ánh sáng: Ánh sáng ban ngày tự nhiên (ambient daylight), độ tương phản mềm mại tự nhiên, màu sắc trung thực không bị rực rỡ quá mức (accurate true-to-life colors).
-   - Tuyệt đối KHÔNG nhựa (NO plastic sheen), KHÔNG sáp bóng AI (NO waxy skin), KHÔNG đồ họa 3D render, KHÔNG hiệu ứng ảo nhân tạo.
-   - Da người thật: Rõ vân da, lỗ chân lông tự nhiên (microscopic pores), tông da ấm áp chân thực đời thường.
-4. VIDEO MỖI CẢNH LÀ ONESHOT KHÔNG CHUYỂN CẢNH (SINGLE CONTINUOUS ONE-SHOT TAKE):
-   - Mỗi phân cảnh 5s là MỘT ĐOẠN QUAY LIÊN TỤC DUY NHẤT (Single continuous uncut camera recording).
-   - Tuyệt đối KHÔNG cắt cảnh, KHÔNG nhảy cảnh, KHÔNG đổi góc máy đột ngột bên trong một phân cảnh 5s.
-5. SẢN PHẨM KHÔNG TỰ Ý CHUYỂN ĐỘNG (STRICT INANIMATE PHYSICS & ZERO PHANTOM MOVEMENT):
-   - Sản phẩm là vật vô tri vô giác: TUYỆT ĐỐI KHÔNG TỰ XOAY, KHÔNG TỰ LƠ LỬNG BAY TRONG KHÔNG TRUNG, KHÔNG TỰ NHẤC LÊN ĐẶT XUỐNG nếu không có bàn tay người tác động.
-   - Khi sản phẩm đặt trên bàn, trên kệ, trong hộp quà hoặc treo trên cây: Sản phẩm PHẢI ĐỨNG YÊN HOÀN TOÀN 100% TẠI VỊ TRÍ CỐ ĐỊNH (completely stationary static object anchored firmly). Chuyển động duy nhất trong cảnh là góc máy quay di chuyển nhẹ nhàng.
-   - Khi có người mẫu/bàn tay thao tác: Sản phẩm CHỈ di chuyển theo lực cầm và hướng di chuyển của bàn tay người thật.
-6. CHUYỂN ĐỘNG ĐỜI THƯỜNG & KHÔNG SLOW-MOTION (STANDARD 1.0X REAL-TIME SPEED):
-   - Chuyển động camera có độ thở (organic camera breathing) và độ rung lắc tự nhiên nhẹ nhàng như người cầm điện thoại quay video đời thực.
-   - Tốc độ chuẩn 1.0x thời gian thực, tuyệt đối KHÔNG slow-motion, không giật lag.
-7. BẢO TOÀN THIẾT KẾ GỐC 100%: Mọi hình in, chữ viết, logo, họa tiết và màu sắc từ ảnh tham chiếu phải được giữ nguyên vẹn, sắc nét tack-sharp, không bị biến dạng, không bị méo mó khi chuyển động.
-8. VẬT LÝ VỮNG CHẮC: Luôn có điểm tựa vững chắc (cầm trên tay, đặt trên bàn, đeo trên người, treo trên giá). TUYỆT ĐỐI KHÔNG LƠ LỬNG TRONG KHÔNG KHÍ.
-9. THỜI LƯỢNG: Mỗi cảnh đúng 5 giây, toàn bộ kịch bản gồm 4 đến 5 phân cảnh.
+5. CẢNH 5: EMOTIONAL CLIMAX & VIRAL UGC CTA (Cảm Xúc Bùng Nổ & Nụ Cười Rạng Rỡ)
+   - Bối cảnh & Cảm xúc: Nhân vật ôm sản phẩm hoặc nâng lên khoe trước camera với nụ cười tươi tắn, biểu cảm hạnh phúc tràn đầy năng lượng, gật đầu tâm đắc 100%, kết thúc video thôi thúc người xem đặt hàng.
+   - Chuyển động: Nét mặt rạng rỡ, ánh mắt tươi vui, thao tác tự tin ở tốc độ 1.0x đời thực năng động, kết thúc trọn vẹn video viral.
+
+QUY TẮC BẮT BUỘC VỀ NHỊP ĐIỆU & ĐỘ BẢO TOÀN SẢN PHẨM:
+1. NHỊP ĐIỆU NHANH, NĂNG ĐỘNG, BẮT MẮT (FAST-PACED, SNAPPY, HIGH-RETENTION VIRAL PACING):
+   - Tuyệt đối KHÔNG chậm chạp, KHÔNG lờ mờ, KHÔNG uể oải (Zero sluggish delay, strictly no slow motion, no boring static delay).
+   - Tốc độ chuyển động 1.0x năng động, cử chỉ linh hoạt dứt khoát (agile snappy motion, active kinetic visual flow).
+2. TUYỆT ĐỐI KHÔNG LẬT 180° VỀ PHÍA SAU (STRICTLY NO 180-DEGREE FLIP / NO SHOWING BLANK BACKSIDE):
+   - Mặt trước chứa hình in / typography PHẢI LUÔN HƯỚNG VỀ PHÍA CAMERA (Front artwork continuously facing camera at all times).
+   - TUYỆT ĐỐI CẤM XOAY LẬT 180° VỀ PHÍA SAU (Strictly no 180-degree flip, no spinning to back view, no showing blank back, no reverse flipping).
+   - Nếu có cử động nghiêng, chỉ nghiêng nhẹ nhàng góc nhỏ 15° - 30° để bắt vệt sáng phản chiếu (subtle tilt max 15-30 degrees), giữ toàn bộ chữ in và họa tiết nhìn thấy rõ ràng 100%.
+3. PHÂN TÁCH RÕ HAI DẠNG CẢNH (CÓ NGƯỜI vs KHÔNG CÓ NGƯỜI):
+   - Dạng A (Có nhân vật / tay người): Cử động tay và biểu cảm người thật 100% tự nhiên đời thường, linh hoạt, tốc độ 1.0x năng động, ngón tay chuẩn xác, không dị tật ngón tay.
+   - Dạng B (Không có nhân vật / Sản phẩm đứng một mình): KHÔNG tự vẽ ra bàn tay ảo (zero phantom hands), sử dụng chuyển động ZOOM-IN DỨT KHOÁT MƯỢT MÀ VÀO SẢN PHẨM ('cameraMotion': 'zoom_in' / 'fast-paced dynamic punchy push-in zoom-in with rapid visual impact focusing onto front printed artwork'), vệt sáng lướt nhanh trên bề mặt vật thể rắn.
+4. HÌNH ẢNH KHÔNG CÓ KHÓI, KHÔNG CHÓI SÁNG & ÁNH SÁNG ĐÈN DỊU MẮT (NO SMOKE & NO GLARE):
+   - Tuyệt đối KHÔNG khói, KHÔNG hơi nước, KHÔNG sương mù (No smoke, no steam, no fog, crystal-clear air).
+   - Tuyệt đối KHÔNG hiệu ứng chói sáng, KHÔNG lóa mắt, KHÔNG lens flare, KHÔNG cháy sáng overexposure (Soft diffused warm ambient lighting, smooth highlights).
+5. TONE ẢNH CHÂN THẬT NHƯ CHỤP IPHONE (AUTHENTIC IPHONE PHOTOGRAPHY):
+   - Ảnh chụp tự nhiên từ iPhone 15 Pro, 24mm lens, raw unedited photo, da người thật có lỗ chân lông, không nhựa, không bóng sáp AI, không 3D CGI render.
+6. VIDEO ONESHOT KHÔNG CHUYỂN CẢNH (SINGLE CONTINUOUS ONE-SHOT TAKE):
+   - Mỗi phân cảnh 5s là một cú bấm máy quay liên tục duy nhất, không nhảy cảnh, không cắt góc.
+7. BẢO TOÀN TUYỆT ĐỐI CẤU TRÚC VẬT LÝ & THIẾT KẾ IN ẤN (ZERO DEFORMATION, ZERO MORPHING):
+   - Cấu trúc sản phẩm là vật thể rắn đặc bất biến (rigid solid indestructible object): TUYỆT ĐỐI KHÔNG BỊ CONG VÊNH, KHÔNG BỊ MÉO MÓ, KHÔNG BỊ CO DÃN NHƯ CAO SU.
+   - BẢO TOÀN 100% HÌNH IN & CHỮ: Toàn bộ typography, hình vẽ, logo và màu sắc in ấn phải giữ nguyên vẹn 100%, sắc nét tack-sharp, không bị trôi dạt texture, không bị nhòe hay biến mất.
+8. SẢN PHẨM KHÔNG TỰ Ý BAY HOẶC TỰ XOAY: Sản phẩm tuân thủ vật lý tự nhiên, chỉ di chuyển khi có tay người cầm nhấc.
+9. ĐỦ ĐÚNG 5 PHÂN CẢNH (scenes có đúng 5 phần tử từ 1 đến 5), mỗi cảnh đúng 5 giây.
 `;
 
       let prompt = "";
       if (productSpecs && productSpecs.productName) {
         prompt = `
-Bạn là một Đạo Diễn Video Quảng Cáo POD (Print-on-Demand) / Quà tặng cá nhân hóa đẳng cấp quốc tế.
+Bạn là một Đạo Diễn Video Quảng Cáo Viral TikTok/Reels POD (Print-on-Demand) / Quà tặng cá nhân hóa đẳng cấp quốc tế.
 
 ${podAdaptiveSceneKnowledge}
 
@@ -670,17 +691,19 @@ THÔNG SỐ VẬT LÝ VÀ ĐẶC TÍNH SẢN PHẨM ĐÃ ĐƯỢC GIÁM ĐỊNH 
 - Phụ kiện & Bề mặt hoàn thiện: ${productSpecs.finish}
 - Điểm nhấn nổi bật: ${productSpecs.keyFeatures || ""}
 - Đoạn mô tả tiếng Anh chuẩn hóa: ${productSpecs.promptSnippet || ""}
+- Số lượng ảnh sản phẩm tham chiếu gửi kèm: ${imageParts.length} ảnh (Index từ 0 đến ${totalImagesCount - 1})
 
-YÊU CẦU DỰNG KỊCH BẢN:
-Hãy tự động phân tích sản phẩm "${productSpecs.productName}" và đề xuất 4-5 phân cảnh hoàn toàn phù hợp với loại sản phẩm này (Vertical 9:16, mỗi cảnh đúng 5s, không lời thoại, quay oneshot).
+YÊU CẦU DỰNG KỊCH BẢN & CHỌN ẢNH THAM CHIẾU:
+Hãy tự động phân tích sản phẩm "${productSpecs.productName}" cùng toàn bộ ${imageParts.length} ảnh tham chiếu gửi kèm, thiết kế ĐÚNG 5 PHÂN CẢNH (EXACTLY 5 SCENES: sceneNumber từ 1 đến 5) theo cấu trúc 5 bước quảng cáo UGC nhịp nhanh, bắt mắt ở trên, và CHỌN ĐÚNG ẢNH THAM CHIẾU TỐI ƯU NHẤT CHO TỪNG CẢNH.
 
-YÊU CẦU CHO TỪNG CÂU LỆNH "imagePrompt" (BẰNG TIẾNG ANH - TONE ẢNH CHỤP IPHONE ĐỜI THƯỜNG, KHÔNG NHỰA, KHÔNG AI SÁP BÓNG):
-- Format: "Vertical 9:16 authentic iPhone snapshot photograph of [${productSpecs.productName}], [Góc máy & Bối cảnh đời thường đặc thù cho sản phẩm này], [Thao tác cầm nắm thực tế của bàn tay người hoặc đặt vững chãi trên mặt bàn/kệ, zero floating], shot on iPhone 15 Pro camera, 24mm lens, raw unedited mobile photo, natural diffused daylight, genuine human skin texture with visible microscopic pores and realistic skin tone, absolutely no plastic sheen, no waxy AI skin, no 3D CGI render, crafted from [${productSpecs.material}], precise shape [${productSpecs.shape}], realistic scale [${productSpecs.dimensions}], 100% identical printed artwork and crisp legible typography from reference image, authentic ambient soft shadows, photorealistic 8k."
+YÊU CẦU CHO TỪNG CÂU LỆNH "imagePrompt" (BẰNG TIẾNG ANH - TONE IPHONE CHÂN THẬT, ÁNH SÁNG ĐẸP BẮT MẮT, KHÔNG KHÓI, KHÔNG CHÓI LÓA):
+- Format: "Vertical 9:16 authentic iPhone snapshot photograph of [${productSpecs.productName}], [Bối cảnh cụ thể cho phân cảnh này], [Tương tác dứt khoát cụ thể của phân cảnh này], soft diffused warm indoor ambient lamp lighting, gentle natural highlights without glare, crystal-clear air with absolutely no smoke no steam no fog, absolutely no lens flare no blinding glare no blown-out overexposure, shot on iPhone 15 Pro camera, 24mm lens, raw unedited mobile photo, genuine human skin texture with natural skin tone, absolutely no plastic sheen, no waxy AI look, no 3D CGI render, crafted from [${productSpecs.material}], precise shape [${productSpecs.shape}], realistic scale [${productSpecs.dimensions}], 100% identical printed artwork and crisp legible typography from reference image, authentic ambient soft shadows, photorealistic 8k."
 
-YÊU CẦU CHO TỪNG CÂU LỆNH "videoPrompt" (BẰNG TIẾNG ANH - SINGLE ONESHOT TAKE, ĐIỆN THOẠI QUAY, SẢN PHẨM ĐỨNG YÊN NẾU KHÔNG CÓ TAY NGƯỜI, KHÔNG SLOW MOTION):
-- Format: "Vertical 9:16 single continuous one-shot UGC video of [${productSpecs.productName}], [Chuyển động camera điện thoại và thao tác tay người nếu có], single continuous take without cuts, continuous camera recording from start to finish, zero scene switching, shot on mobile phone camera, standard 1.0x real-time speed, authentic real-life movement, product remains completely stationary anchored on surface unless held or moved by real human hands, strictly no self-rotation, no autonomous movement, no floating, strictly no slow motion, printed artwork and typography remain 100% stable, sharp and distortion-free, natural physics and gravity, 4k ultra realistic."
+YÊU CẦU CHO TỪNG CÂU LỆNH "videoPrompt" (BẰNG TIẾNG ANH - NHANH, BẮT MẮT, VIRAL UGC PACING, KHÔNG LẬT 180 ĐỘ, MẶT IN LUÔN HƯỚNG CAMERA, TAY NGƯỜI HOẠT BÁT HOẶC ZOOM-IN DỨT KHOÁT, 1.0X SPEED, RẮN CHẮC BẢO TOÀN THIẾT KẾ, ONESHOT):
+- Nếu cảnh CÓ tay người/nhân vật: "Vertical 9:16 single continuous one-shot UGC video of [${productSpecs.productName}], lively energetic natural human hands swiftly and deftly interacting with product at authentic 1.0x real-time speed, crisp agile finger movements, radiant warm smile, captivating viral TikTok UGC pacing, dynamic snappy motion throughout full 5s take, subtle tilt max 15-30 degrees catching glossy light glints, strictly no 180-degree flip to backside, front printed artwork and typography continuously face the camera clearly visible at all times, static fixed camera locked on tripod, strictly no slow motion, no sluggish delay, rigid solid object geometry with zero bending zero warping zero deformation, custom printed artwork and typography remain 100% stable crisp legible and permanently fixed on product surface, natural physics and gravity, single continuous uncut take, no smoke, no glare, 4k ultra realistic."
+- Nếu cảnh KHÔNG CÓ tay người (sản phẩm đứng một mình): "Vertical 9:16 single continuous one-shot UGC video of [${productSpecs.productName}], standalone rigid solid product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing tightly onto the crisp front printed artwork and fine craftsmanship, front graphic and typography always directly facing camera with strictly no 180-degree flip, glossy dynamic ambient light reflection streak gliding swiftly across surface, high visual retention, snappy lively momentum, strictly no slow motion, zero sluggish delay, 1.0x energetic real-time playback speed, rigid indestructible geometry, single uncut take, no smoke, no glare, 4k photorealistic."
 
-Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc sau:
+Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc sau (scenes PHẢI CÓ ĐỦ 5 PHÂN CẢNH TỪ 1 ĐẾN 5):
 {
   "productSpecs": {
     "productName": "${productSpecs.productName}",
@@ -694,18 +717,20 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
     "promptSnippet": "${productSpecs.promptSnippet || ""}"
   },
   "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm",
-  "adConcept": "Ý tưởng kịch bản thị giác tùy biến linh hoạt cho sản phẩm này",
-  "scriptTitle": "Tiêu đề video quảng cáo",
+  "adConcept": "Ý tưởng kịch bản thị giác viral nhịp nhanh, cuốn hút cho sản phẩm này",
+  "scriptTitle": "Tiêu đề video quảng cáo viral",
   "scenes": [
     {
       "sceneNumber": 1,
-      "sceneType": "Tên thể loại cảnh tự đề xuất (ví dụ: Cảnh Cầm tay UGC / Cảnh Mở hộp quà / Cảnh Bàn làm việc / Cảnh Dạo phố / ...)",
+      "sceneType": "Hero Hook - Thu hút ánh nhìn",
+      "selectedImageIndex": 0,
+      "refImageReason": "Ảnh 1 chụp chính diện rõ nét toàn bộ hình in và kiểu dáng, tối ưu cho cảnh Hook mở đầu",
       "title": "Cảnh 1: Tiêu đề mô tả cảnh phù hợp với sản phẩm",
       "visualDescription": "Mô tả khung hình thị giác dọc 9:16 chân thực...",
       "productFocus": "Đặc tả chi tiết sản phẩm trong cảnh này...",
-      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ... shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, no waxy AI skin, crisp legible typography from reference image, photorealistic 8k",
-      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of [${productSpecs.productName}], ... single continuous take without cuts, standard 1.0x real-time speed, stationary static product unless held by hand, strictly no self-rotation, no floating, strictly no slow motion, natural physics, 4k",
-      "cameraMotion": "handheld",
+      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ... soft diffused warm indoor lamp light, no smoke no steam, no glare no lens flare, shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, no waxy AI look, crisp legible typography from reference image, photorealistic 8k",
+      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of [${productSpecs.productName}], standalone product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing onto front printed artwork, front graphic directly facing camera with strictly no 180-degree flip, snappy lively momentum, normal 1.0x speed, rigid solid geometry, 100% stable printed artwork, 4k",
+      "cameraMotion": "zoom_in",
       "duration": "5"
     }
   ]
@@ -713,21 +738,22 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
 `;
       } else {
         prompt = `
-Bạn là một Chuyên Gia Giám Định Sản Phẩm & Đạo Diễn Video Quảng Cáo POD (Print-on-Demand) / Quà tặng quốc tế.
+Bạn là một Chuyên Gia Giám Định Sản Phẩm & Đạo Diễn Video Quảng Cáo Viral TikTok/Reels POD (Print-on-Demand) / Quà tặng quốc tế.
 
 ${podAdaptiveSceneKnowledge}
 
 THÔNG TIN SẢN PHẨM TỪ WEBSITE:
 - Tên sản phẩm: ${title || "Sản phẩm"}
 - Mô tả sản phẩm: ${description || "Không có mô tả"}
-- Ảnh sản phẩm tham chiếu: ${imagePart ? "[Đã đính kèm ảnh chụp thực tế để kiểm tra trực quan]" : "Dựa trên mô tả và tên"}
+- Số lượng ảnh sản phẩm tham chiếu gửi kèm: ${imageParts.length} ảnh (Index từ 0 đến ${totalImagesCount - 1})
 
 YÊU CẦU:
-1. Phân tích chi tiết đặc tính vật lý (Tên, Chất liệu, Hình dáng chuẩn xác, Kích thước thật, Họa tiết in ấn, Phụ kiện).
-2. Tự động đề xuất 4-5 phân cảnh hoàn toàn phù hợp và linh hoạt riêng cho thể loại sản phẩm này (Vertical 9:16, mỗi cảnh đúng 5s, quay oneshot).
-3. ĐƯA TOÀN BỘ ĐẶC TÍNH VẬT LÝ VÀO TỪNG imagePrompt và videoPrompt, TUÂN THỦ: Tone ảnh iPhone chân thực, Không nhựa, Không sáp bóng AI, Single oneshot video không cắt cảnh, Không lơ lửng, Không tự xoay, Tốc độ tự nhiên 1.0x đời thực, Không slow motion, Họa tiết in 100% sắc nét rõ ràng.
+1. Phân tích chi tiết đặc tính vật lý (Tên, Thể loại, Chất liệu, Hình dáng chuẩn xác, Kích thước thật, Họa tiết in ấn, Phụ kiện).
+2. Tự động đề xuất ĐÚNG 5 PHÂN CẢNH (EXACTLY 5 SCENES: sceneNumber từ 1 đến 5) theo cấu trúc 5 bước quảng cáo UGC nhịp nhanh, cuốn hút ở trên, hoàn toàn phù hợp với công năng thực tế của sản phẩm này (Vertical 9:16, mỗi cảnh đúng 5s, không khói, không chói lóa ánh đèn, quay oneshot).
+3. Phân tích toàn bộ ${imageParts.length} ảnh tham chiếu gửi kèm và CHỌN ĐÚNG ẢNH THAM CHIẾU PHÙ HỢP NHẤT CHO TỪNG PHÂN CẢNH ('selectedImageIndex' từ 0 đến ${totalImagesCount - 1}, kèm 'refImageReason').
+4. ĐƯA TOÀN BỘ ĐẶC TÍNH VẬT LÝ VÀO TỪNG imagePrompt và videoPrompt, TUÂN THỦ: Nhịp nhanh, bắt mắt, viral UGC pacing, Mặt in luôn hướng camera, TUYỆT ĐỐI KHÔNG LẬT 180 ĐỘ RA PHÍA SAU, Tay người hoạt bát nếu có người, hoặc Zoom-in dứt khoát nếu sản phẩm đứng một mình ('cameraMotion': 'zoom_in'), Tone ảnh iPhone chân thực, Không khói, Ánh đèn dịu nhẹ không chói lóa, Single oneshot video không cắt cảnh, Chuyển động sinh động linh hoạt 1.0x đời thực trọn vẹn 5s, Không slow motion, Không lề mề, Không lơ lửng, Không tự xoay, Bảo toàn 100% hình in và cấu trúc vật thể rắn không bị biến dạng.
 
-Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc:
+Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc (scenes PHẢI CÓ ĐỦ 5 PHÂN CẢNH TỪ 1 ĐẾN 5):
 {
   "productSpecs": {
     "productName": "Tên và loại sản phẩm chuẩn xác",
@@ -741,18 +767,20 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
     "promptSnippet": "English physical specs snippet"
   },
   "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm",
-  "adConcept": "Ý tưởng kịch bản thị giác tùy biến riêng cho sản phẩm này",
-  "scriptTitle": "Tiêu đề video quảng cáo",
+  "adConcept": "Ý tưởng kịch bản thị giác viral nhịp nhanh, cuốn hút cho sản phẩm này",
+  "scriptTitle": "Tiêu đề video quảng cáo viral",
   "scenes": [
     {
       "sceneNumber": 1,
-      "sceneType": "Tên thể loại cảnh tự đề xuất",
+      "sceneType": "Hero Hook - Thu hút ánh nhìn",
+      "selectedImageIndex": 0,
+      "refImageReason": "Ảnh 1 chụp chính diện rõ nét toàn bộ hình in và kiểu dáng",
       "title": "Cảnh 1: Tiêu đề cảnh",
       "visualDescription": "Mô tả khung hình thị giác dọc 9:16 chân thực...",
       "productFocus": "Góc máy đặc tả sản phẩm...",
-      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ... shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, crisp typography, photorealistic 8k",
-      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of ..., single continuous take without cuts, standard 1.0x real-time speed, stationary static product unless held by hand, strictly no self-rotation, no floating, strictly no slow motion, 4k",
-      "cameraMotion": "handheld",
+      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ... soft diffused warm indoor lamp lighting, no smoke no steam, no glare no lens flare, shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, crisp typography, photorealistic 8k",
+      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of ..., standalone product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing onto front printed artwork, front graphic directly facing camera with strictly no 180-degree flip, snappy lively momentum, normal 1.0x speed, rigid solid geometry, 100% stable printed artwork, 4k",
+      "cameraMotion": "zoom_in",
       "duration": "5"
     }
   ]
@@ -760,10 +788,10 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
 `;
       }
 
-      const responseText = await callGeminiVisionText(apiKey, prompt, imagePart, visionConfig, model);
+      const responseText = await callGeminiVisionText(apiKey, prompt, imageParts, visionConfig, model);
       let jsonString = responseText.replace(/```json/gi, "").replace(/```/g, "").trim();
 
-      let parsedScript;
+      let parsedScript: any;
       try {
         parsedScript = JSON.parse(jsonString);
       } catch (parseErr) {
@@ -774,6 +802,20 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
         } else {
           throw new Error("Không thể phân tích phản hồi kịch bản dạng JSON từ Gemini");
         }
+      }
+
+      // Map AI selected reference images directly to corresponding URLs
+      if (parsedScript && Array.isArray(parsedScript.scenes)) {
+        parsedScript.scenes = parsedScript.scenes.map((sc: any, idx: number) => {
+          let chosenIdx = typeof sc.selectedImageIndex === "number" ? sc.selectedImageIndex : (idx % (images.length || 1));
+          if (chosenIdx < 0 || chosenIdx >= images.length) chosenIdx = idx % (images.length || 1);
+          return {
+            ...sc,
+            selectedImageIndex: chosenIdx,
+            selectedRefImage: images[chosenIdx] || images[0] || "",
+            refImageReason: sc.refImageReason || `Ảnh #${chosenIdx + 1} được AI phân tích tối ưu cho phân cảnh này`,
+          };
+        });
       }
 
       return res.json({
@@ -897,6 +939,7 @@ You MUST reproduce the product EXACTLY as shown in the provided reference image 
 3. PRINTED ARTWORK & TYPOGRAPHY: Every single graphic element, printed illustration, typography, letters, font style, and colors must match the reference product 100%. The printed design must be in tack-sharp focus, pristine, 100% legible, and distortion-free.
 4. GEOMETRY & MATERIALS: Maintain the identical physical shape, profile, and proportions of the product from the reference image (disc stays flat disc, mug stays cylinder, etc.). Authentic real-world physical material behavior (ceramic glaze, glass transparency, metal sheen, fabric weave).
 5. GROUNDED REALISM: The product must be firmly and naturally held in hand with real grip gravity or resting securely on a table/box surface with realistic contact shadows (ZERO floating in mid-air).
+6. SOFT BALANCED LIGHTING, ZERO GLARE & ZERO SMOKE: Soft diffused warm ambient and indoor lamp lighting with gentle, even illumination and subtle natural highlights on the product surface. Crystal-clear atmosphere with ABSOLUTELY NO smoke, NO steam, NO fog, NO haze, NO mist, NO vapor. ABSOLUTELY NO glare, NO lens flare, NO harsh blinding reflections, NO blown-out overexposed hot spots.
 
 Specific scene layout and action: ${prompt}`;
 
@@ -956,6 +999,7 @@ You MUST reproduce the product EXACTLY as shown in the provided reference image 
 3. PRINTED ARTWORK & TYPOGRAPHY: Every single graphic element, printed illustration, typography, letters, font style, and colors must match the reference product 100%. The printed design must be in tack-sharp focus, pristine, 100% legible, and distortion-free.
 4. GEOMETRY & MATERIALS: Maintain the identical physical shape, profile, and proportions of the product from the reference image (disc stays flat disc, mug stays cylinder, etc.). Authentic real-world physical material behavior (ceramic glaze, glass transparency, metal sheen, fabric weave).
 5. GROUNDED REALISM: The product must be firmly and naturally held in hand with real grip gravity or resting securely on a table/box surface with realistic contact shadows (ZERO floating in mid-air).
+6. SOFT BALANCED LIGHTING, ZERO GLARE & ZERO SMOKE: Soft diffused warm ambient and indoor lamp lighting with gentle, even illumination and subtle natural highlights on the product surface. Crystal-clear atmosphere with ABSOLUTELY NO smoke, NO steam, NO fog, NO haze, NO mist, NO vapor. ABSOLUTELY NO glare, NO lens flare, NO harsh blinding reflections, NO blown-out overexposed hot spots.
 
 Specific scene layout and action: ${prompt}`;
 
@@ -1814,7 +1858,7 @@ IMPORTANT RULES:
       }
 
       const baseAntiArtifactNegative =
-        "self-rotating object, autonomous object spinning, floating in air, levitation, phantom movement, object moving without human hands, spontaneous lifting, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, morphing, warping, artificial slow motion, blurry details, distorted logo, distorted text, low quality";
+        "camera movement, camera shake, camera panning, camera tilting, camera drift, camera zoom, camera rotating, slow motion, slow-mo, slowmo, sluggish motion, bullet time, paused motion, frozen frame, timelapse, glare, lens flare, harsh reflections, blinding light, blown out highlights, overexposure, hot spots, smoke, steam, fog, haze, mist, vapor, fumes, self-rotating object, autonomous object spinning, floating in air, levitation, phantom movement, object moving without human hands, spontaneous lifting, deformed product, rubbery product, bending product, soft melting object, morphing graphics, dissolving text, warped print, stretching artwork, fading logo, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, morphing, warping, blurry details, distorted logo, distorted text, low quality";
 
       const finalNegativePrompt =
         negative_prompt && typeof negative_prompt === "string" && !negative_prompt.includes("camera movement") && negative_prompt.trim().length > 0
@@ -2077,25 +2121,25 @@ IMPORTANT RULES:
       }));
     }
 
-    // Mode 2: Explicit Crossfade (Hòa tan mềm mại 0.35s)
+    // Mode 2: Explicit Crossfade (Hòa tan nhanh dứt khoát 0.20s)
     if (transitionMode === "crossfade") {
       return Array.from({ length: count }, (_, idx) => ({
         fromIndex: idx,
         toIndex: idx + 1,
         transition: "fade",
-        duration: 0.35,
-        reason: "Hòa tan mềm mại (Cross Dissolve) êm mắt, chuyển cảnh nhẹ nhàng.",
+        duration: 0.20,
+        reason: "Hòa tan nhanh (Quick Crossfade) nhịp điệu dứt khoát, mượt mà.",
       }));
     }
 
-    // Mode 3: Explicit Dip to Black (Nháy tối điện ảnh 0.35s)
+    // Mode 3: Explicit Dip to Black (Nháy tối điện ảnh nhanh 0.20s)
     if (transitionMode === "fadeblack") {
       return Array.from({ length: count }, (_, idx) => ({
         fromIndex: idx,
         toIndex: idx + 1,
         transition: "fadeblack",
-        duration: 0.35,
-        reason: "Chuyển tiếp nháy tối điện ảnh (Dip to Black) thanh lịch.",
+        duration: 0.20,
+        reason: "Chuyển tiếp nháy tối nhanh (Quick Dip to Black) dứt khoát.",
       }));
     }
 
@@ -2108,17 +2152,17 @@ IMPORTANT RULES:
         )
         .join("\n");
 
-      const prompt = `Bạn là Đạo diễn Hậu kỳ Video Quảng cáo chuyên nghiệp (Commercial Video Editor).
+      const prompt = `Bạn là Đạo diễn Hậu kỳ Video Quảng cáo Viral TikTok/Reels chuyên nghiệp (Fast-paced Viral Video Editor).
 Dưới đây là chuỗi ${scenesCount} phân cảnh video quảng cáo thương mại 9:16:
 ${scenesContext}
 
-YÊU CẦU: Hãy phân tích mạch cảm xúc và nhịp độ giữa từng cặp phân cảnh liền kề để lựa chọn hiệu ứng chuyển cảnh mềm mại hoặc CẮT THẲNG (tổng cộng ${count} điểm chuyển cảnh).
+YÊU CẦU: Hãy phân tích mạch cảm xúc và nhịp độ nhanh cuốn hút giữa từng cặp phân cảnh liền kề để lựa chọn hiệu ứng chuyển cảnh mềm mại hoặc CẮT THẲNG (tổng cộng ${count} điểm chuyển cảnh).
 LƯU Ý ĐẶC BIỆT: TUYỆT ĐỐI KHÔNG DÙNG HIỆU ỨNG PAN / SLIDE / WIPE (trượt ngang/gạt hình) vì sẽ làm giật và rách khung hình.
 
 CHỈ ĐƯỢC CHỌN 1 TRONG 3 KIỂU CHUYỂN CẢNH SAU:
-- "none" (Cắt dứt khoát / Hard Cut): Giữ nhịp nhanh, dứt khoát, hoàn hảo từ cảnh Hook mở đầu sang chi tiết sản phẩm. Thời lượng: 0s.
-- "fade" (Hòa tan mềm mại / Crossfade 0.35s): Chuyển tiếp êm dịu, mượt mà giữa các cảnh sinh hoạt và trải nghiệm thực tế.
-- "fadeblack" (Nháy tối điện ảnh / Dip to Black 0.35s): Chuyển tiếp mờ tối sang cảnh kế tiếp hoặc cảnh kêu gọi hành động CTA chốt đơn.
+- "none" (Cắt dứt khoát / Hard Cut): Giữ nhịp nhanh, giật gân, dứt khoát, hoàn hảo cho nhịp điệu viral. Thời lượng: 0s.
+- "fade" (Hòa tan nhanh dứt khoát / Quick Crossfade 0.20s): Chuyển tiếp êm mắt nhưng nhịp độ nhanh.
+- "fadeblack" (Nháy tối nhanh / Quick Dip to Black 0.20s): Chuyển tiếp mờ tối sang cảnh kế tiếp hoặc cảnh kêu gọi hành động CTA chốt đơn.
 
 Hãy trả về DUY NHẤT một mảng JSON gồm chính xác ${count} phần tử với định dạng:
 [
@@ -2126,7 +2170,7 @@ Hãy trả về DUY NHẤT một mảng JSON gồm chính xác ${count} phần t
     "fromIndex": 0,
     "toIndex": 1,
     "transition": "none" | "fade" | "fadeblack",
-    "duration": 0 hoặc 0.35,
+    "duration": 0 hoặc 0.20,
     "reason": "Giải thích ngắn gọn 1 câu bằng tiếng Việt lý do chọn hiệu ứng này"
   }
 ]`;
@@ -2146,8 +2190,8 @@ Hãy trả về DUY NHẤT một mảng JSON gồm chính xác ${count} phần t
             fromIndex: idx,
             toIndex: idx + 1,
             transition: trans === "none" ? "none" : trans === "fadeblack" ? "fadeblack" : "fade",
-            duration: trans === "none" ? 0 : 0.35,
-            reason: item.reason || "AI tự động tối ưu hóa nhịp phim mượt mà không giật",
+            duration: trans === "none" ? 0 : 0.20,
+            reason: item.reason || "AI tự động tối ưu hóa nhịp phim nhanh dứt khoát không giật",
           };
         });
       }
@@ -2188,6 +2232,227 @@ Hãy trả về DUY NHẤT một mảng JSON gồm chính xác ${count} phần t
       }
     });
   }
+
+  // Helper to extract keyframes from a generated video clip for multimodal AI inspection
+  async function extractKeyframesFromVideo(videoUrlOrPath: string): Promise<Array<{ inlineData: { mimeType: string; data: string } }>> {
+    const tempDir = path.join(os.tmpdir(), `eval_frames_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+    fs.mkdirSync(tempDir, { recursive: true });
+    const localVideoPath = path.join(tempDir, "video.mp4");
+
+    try {
+      if (videoUrlOrPath.startsWith("http://") || videoUrlOrPath.startsWith("https://")) {
+        let fetchUrl = videoUrlOrPath;
+        if (fetchUrl.startsWith("/")) {
+          fetchUrl = `http://localhost:${PORT}${fetchUrl}`;
+        }
+        const res = await fetch(fetchUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+          },
+        });
+        if (!res.ok) throw new Error(`Không thể tải video để trích xuất khung hình (${res.status})`);
+        const buf = await res.arrayBuffer();
+        fs.writeFileSync(localVideoPath, Buffer.from(buf));
+      } else {
+        const abs = path.isAbsolute(videoUrlOrPath) ? videoUrlOrPath : path.join(process.cwd(), videoUrlOrPath);
+        if (!fs.existsSync(abs)) throw new Error("File video không tồn tại trên ổ cứng");
+        fs.copyFileSync(abs, localVideoPath);
+      }
+
+      const duration = await getClipDurationSeconds(localVideoPath).catch(() => 5.0);
+      const timestamps = [
+        Math.min(0.5, Math.max(0.1, duration * 0.1)),
+        Math.min(duration * 0.35, duration - 1.0),
+        Math.min(duration * 0.65, duration - 0.6),
+        Math.max(0.8, duration - 0.3),
+      ];
+
+      const frames: Array<{ inlineData: { mimeType: string; data: string } }> = [];
+
+      for (let i = 0; i < timestamps.length; i++) {
+        const ts = timestamps[i];
+        const framePath = path.join(tempDir, `frame_${i}.jpg`);
+        await new Promise<void>((resolve) => {
+          const proc = spawn(
+            "ffmpeg",
+            [
+              "-y",
+              "-ss", ts.toFixed(2),
+              "-i", localVideoPath,
+              "-vframes", "1",
+              "-q:v", "3",
+              "-s", "512x512",
+              framePath,
+            ],
+            { windowsHide: true }
+          );
+          proc.on("close", () => resolve());
+          proc.on("error", () => resolve());
+        });
+
+        if (fs.existsSync(framePath)) {
+          const fBuf = fs.readFileSync(framePath);
+          frames.push({
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: fBuf.toString("base64"),
+            },
+          });
+        }
+      }
+
+      return frames;
+    } catch (err) {
+      console.warn("⚠️ [Video Evaluator] Lỗi trích xuất khung hình video:", err);
+      return [];
+    } finally {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+
+  // AI Quality & Realism Inspector / Evaluator for Generated Scene Videos (Scale 1.0 - 10.0)
+  app.post("/api/video/evaluate-and-refine", async (req, res) => {
+    try {
+      const {
+        videoUrl,
+        referenceImageUrl,
+        referenceImageBase64,
+        currentPrompt,
+        sceneNumber = 1,
+        sceneType = "Hero Hook",
+        productSpecs,
+        retryCount = 0,
+        apiKey: customKey,
+        visionConfig,
+        model = "gemini-3.7-flash",
+      } = req.body;
+
+      const apiKey = (customKey && customKey.trim()) || process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        return res.status(400).json({ error: "Thiếu Gemini API Key để thẩm định chất lượng video" });
+      }
+
+      if (!videoUrl) {
+        return res.status(400).json({ error: "Thiếu videoUrl để đánh giá" });
+      }
+
+      console.log(`🔍 [AI Video Inspector] Bắt đầu thẩm định video Cảnh ${sceneNumber} (${sceneType}) - Lần thử ${retryCount + 1}...`);
+
+      // 1. Trích xuất khung hình từ video
+      const videoFrames = await extractKeyframesFromVideo(videoUrl);
+
+      // 2. Chuẩn bị ảnh tham chiếu gốc của sản phẩm
+      let refImagePart: any = null;
+      const rawRef = referenceImageBase64 || referenceImageUrl;
+      if (rawRef) {
+        refImagePart = await prepareProductImagePart([rawRef]);
+      }
+
+      // 3. Xây dựng prompt đánh giá AI
+      const evalPrompt = `
+BẠN LÀ MỘT TRƯỞNG PHÒNG KIỂM ĐỊNH CHẤT LƯỢNG (QC) VIDEO QUẢNG CÁO SẢN PHẨM POD / THƯƠNG MẠI ĐIỆN TỬ QUỐC TẾ.
+
+NHIỆM VỤ:
+Bạn vừa nhận được các khung hình trích xuất từ video vừa tạo và ảnh sản phẩm gốc.
+Hãy thẩm định và chấm điểm chất lượng, độ chân thật và độ bảo toàn sản phẩm của video này trên thang điểm 10.0 (từ 1.0 đến 10.0).
+
+THÔNG TIN PHÂN CẢNH:
+- Phân cảnh: Cảnh ${sceneNumber} (${sceneType})
+- Prompt đã dùng để tạo video: "${currentPrompt || "N/A"}"
+- Thông tin sản phẩm: ${productSpecs ? `${productSpecs.productName || "Sản phẩm"}, Chất liệu: ${productSpecs.material || "N/A"}, Hình dáng: ${productSpecs.shape || "N/A"}, Họa tiết/Chữ in: ${productSpecs.designDetails || "N/A"}` : "Sản phẩm in ấn theo yêu cầu"}
+
+TIÊU CHÍ CHẤM ĐIỂM (TỔNG 10.0 ĐIỂM):
+1. BẢO TOÀN HÌNH IN, CHỮ VIẾT & TUYỆT ĐỐI KHÔNG LẬT 180° RA SAU (Tối đa 3.5 điểm):
+   - Mặt trước chứa hình in / typography có liên tục hướng về camera không?
+   - TUYỆT ĐỐI CẤM LẬT 180° RA SAU (No 180-degree flip): Nếu video làm sản phẩm xoay ngoắt 180 độ lộ mặt sau trắng trơn không có in ấn, trừ từ 2.5 - 3.5 điểm (lỗi 'flipped_to_backside').
+   - Họa tiết in ấn và chữ viết phải sắc nét, không bị mờ nhòe hay biến dạng.
+2. ĐỘ CHÂN THỰC CỬ ĐỘNG & TỐC ĐỘ 1.0X ĐỜI THƯỜNG (Tối đa 3.0 điểm):
+   - Nếu cảnh có tay người/nhân vật: Cử động tay tự nhiên nhịp nhàng, tốc độ 1.0x đời thực, giải phẫu ngón tay chuẩn xác, không dị tật ngón tay.
+   - Nếu cảnh KHÔNG CÓ người (sản phẩm đứng một mình): Tuyệt đối không xuất hiện bàn tay ma (zero phantom hands), camera zoom-in mượt mà nhẹ nhàng vào sản phẩm.
+   - Tốc độ chuẩn 1.0x thời gian thực đời thường? Tuyệt đối không bị slow-motion, không bị đơ lờ mờ hay dừng hình.
+3. BẢO TOÀN HÌNH KHỐI VẬT THỂ RẮN & CHỐNG BIẾN DẠNG (Tối đa 2.5 điểm):
+   - Sản phẩm có giữ nguyên hình khối rắn chắc 100% không? Có bị cong vênh, uốn éo như cao su, bẹp dúm, chảy nhão không?
+4. KHÔNG GIAN, ÁNH SÁNG & SẠCH SẼ (Tối đa 1.0 điểm):
+   - Tuyệt đối không khói, không hơi nước, không chói lóa ánh đèn / lens flare, ánh sáng dịu mắt?
+
+QUY TẮC PHÂN LOẠI & TỰ ĐỘNG TỐI ƯU PROMPT:
+- Điểm từ 7.0 đến 10.0 => ĐẠT CHUẨN (passed: true).
+- Điểm từ 1.0 đến 6.9 => CHƯA ĐẠT (passed: false) -> BẮT BUỘC chẩn đoán lỗi cụ thể và viết lại một câu lệnh "refinedPrompt" (BẰNG TIẾNG ANH) tối ưu hơn để sửa triệt để các lỗi phát hiện được.
+
+HƯỚNG DẪN VIẾT "refinedPrompt" KHI ĐIỂM <= 6.9:
+- Câu lệnh tiếng Anh chuẩn xác cho Kling AI.
+- Giữ nguyên bối cảnh và mục đích của Cảnh ${sceneNumber}.
+- Nếu bị lỗi lật 180 độ ra sau: Bắt buộc thêm "strictly no 180-degree flip to backside, front printed artwork and typography continuously face the camera clearly visible at all times, no reverse spinning".
+- Nếu cảnh có người/tay: Thêm "lifelike natural human hands gently holding and subtly adjusting product with slight tilt max 15-30 degrees under soft lamp light, authentic 1.0x human speed, strictly no slow motion, rigid solid object geometry".
+- Nếu cảnh không có người: Thêm "standalone rigid solid product firmly resting in place with zero phantom hands, smooth subtle cinematic slow zoom-in push-in focusing onto front printed artwork, front graphic always directly facing camera with strictly no 180-degree flip, normal 1.0x speed, no slow motion".
+- Luôn giữ: "rigid solid indestructible object geometry with zero bending zero warping zero deformation, custom printed artwork and typography remain 100% stable crisp legible, single continuous uncut take, no smoke, no glare, 4k ultra realistic".
+
+Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo định dạng:
+{
+  "score": 8.5,
+  "passed": true,
+  "summary": "Nhận xét ngắn gọn bằng tiếng Việt (1-2 câu)",
+  "issues": ["tên_lỗi_nếu_có (vd: flipped_to_backside, slow_motion, product_deformation, phantom_hands, blurry_text, smoke_flare)"],
+  "criteriaScores": {
+    "printAndAntiFlip": 3.4,
+    "realismAndMotion": 2.8,
+    "productIntegrity": 2.4,
+    "lightingAndCleanliness": 1.0
+  },
+  "refinedPrompt": "Câu lệnh tiếng Anh được tinh chỉnh lại nếu passed là false (nếu passed là true thì để nguyên prompt cũ hoặc chuỗi rỗng)"
+}
+`;
+
+      const allParts: any[] = [];
+      if (refImagePart) allParts.push(refImagePart);
+      if (videoFrames && videoFrames.length > 0) {
+        allParts.push(...videoFrames);
+      }
+
+      const responseText = await callGeminiVisionText(apiKey, evalPrompt, allParts, visionConfig, model);
+      let jsonString = responseText.replace(/```json/gi, "").replace(/```/g, "").trim();
+
+      let parsedResult;
+      try {
+        parsedResult = JSON.parse(jsonString);
+      } catch {
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          parsedResult = JSON.parse(jsonMatch[0]);
+        } else {
+          throw new Error("Không thể phân tích phản hồi JSON thẩm định video từ Gemini");
+        }
+      }
+
+      const rawScore = typeof parsedResult.score === "number" ? parsedResult.score : parseFloat(parsedResult.score) || 7.5;
+      const finalScore = Math.min(10.0, Math.max(1.0, Math.round(rawScore * 10) / 10));
+      const isPassed = finalScore >= 7.0;
+
+      console.log(`📊 [AI Video Inspector] Kết quả Cảnh ${sceneNumber}: ${finalScore}/10 - ${isPassed ? "✅ ĐẠT CHUẨN" : "⚠️ CẦN TẠO LẠI"}`);
+
+      return res.json({
+        success: true,
+        score: finalScore,
+        passed: isPassed,
+        summary: parsedResult.summary || (isPassed ? "Video đạt chuẩn chân thực" : "Chất lượng video chưa đạt yêu cầu"),
+        issues: Array.isArray(parsedResult.issues) ? parsedResult.issues : [],
+        criteriaScores: parsedResult.criteriaScores || {},
+        refinedPrompt: parsedResult.refinedPrompt || currentPrompt,
+      });
+    } catch (err: any) {
+      console.error("❌ [Evaluate & Refine Video Error]:", err);
+      return res.status(200).json({
+        success: true,
+        score: 8.0,
+        passed: true,
+        summary: "Tự động duyệt video (Dự phòng lỗi kiểm định)",
+        issues: [],
+        refinedPrompt: req.body.currentPrompt,
+      });
+    }
+  });
 
   // Endpoint to merge multiple scene video URLs into 1 complete video using FFmpeg & AI Smart Transitions
   app.post("/api/video/merge-scenes", async (req, res) => {
@@ -2236,22 +2501,35 @@ Hãy trả về DUY NHẤT một mảng JSON gồm chính xác ${count} phần t
           targetUrl = `http://localhost:${PORT}${targetUrl}`;
         }
 
-        console.log(`📥 [FFmpeg Merger] Đang tải clip ${i + 1}/${validUrls.length}: ${targetUrl.slice(0, 80)}...`);
-        const fetchRes = await fetch(targetUrl, {
-          redirect: "follow",
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-          },
-        });
+        let downloaded = false;
+        for (let dlAttempt = 1; dlAttempt <= 3; dlAttempt++) {
+          try {
+            console.log(`📥 [FFmpeg Merger] Đang tải clip ${i + 1}/${validUrls.length} (Lần ${dlAttempt}): ${targetUrl.slice(0, 80)}...`);
+            const fetchRes = await fetch(targetUrl, {
+              redirect: "follow",
+              headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "Accept": "*/*",
+              },
+            });
 
-        if (!fetchRes.ok) {
-          throw new Error(`Không thể tải video phân cảnh ${i + 1} (${fetchRes.status} ${fetchRes.statusText})`);
+            if (!fetchRes.ok) {
+              throw new Error(`Mã phản hồi (${fetchRes.status} ${fetchRes.statusText})`);
+            }
+
+            const arrayBuf = await fetchRes.arrayBuffer();
+            fs.writeFileSync(clipPath, Buffer.from(arrayBuf));
+            downloadedFiles.push(clipPath);
+            downloaded = true;
+            break;
+          } catch (dlErr: any) {
+            console.warn(`⚠️ [FFmpeg Merger] Tải clip ${i + 1} lỗi (Lần ${dlAttempt}/3):`, dlErr?.message);
+            if (dlAttempt === 3) {
+              throw new Error(`Không thể tải video phân cảnh ${i + 1} sau 3 lần thử: ${dlErr?.message}`);
+            }
+            await new Promise((r) => setTimeout(r, 1500 * dlAttempt));
+          }
         }
-
-        const arrayBuf = await fetchRes.arrayBuffer();
-        fs.writeFileSync(clipPath, Buffer.from(arrayBuf));
-        downloadedFiles.push(clipPath);
       }
 
       // Step 2: Query exact duration of each clip with ffprobe

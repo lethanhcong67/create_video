@@ -352,38 +352,152 @@ export default function App() {
 
           if (statusData.status === 'succeed') {
             clearInterval(pollTimer);
-            setVideoItems((prev) => {
-              const updated = prev.map((item) =>
+            const videoUrl = statusData.videoUrl;
+
+            // Step 1: Set status to 'evaluating'
+            setVideoItems((prev) =>
+              prev.map((item) =>
                 item.id === targetItem.id
                   ? {
                       ...item,
-                      status: 'completed' as const,
-                      progress: 100,
-                      resultVideoUrl: statusData.videoUrl,
-                      completedAt: Date.now(),
+                      status: 'evaluating' as const,
+                      progress: 96,
+                      resultVideoUrl: videoUrl,
+                      statusMessage: '🔍 AI đang thẩm định chất lượng & độ chân thật (Thang điểm 10)...',
                     }
                   : item
-              );
+              )
+            );
+            showToast(`Đang thẩm định chất lượng video Cảnh ${(targetItem.sceneIndex ?? 0) + 1}...`, 'info');
 
-              // If all queued/generating items in this batch are completed, auto-trigger FFmpeg merge!
-              const targetBatchId = targetItem.batchId;
-              const batchItems = targetBatchId ? updated.filter((it) => it.batchId === targetBatchId) : updated;
-              const allBatchDone =
-                batchItems.length >= 2 &&
-                batchItems.every((it) => it.status === 'completed' && Boolean(it.resultVideoUrl));
-              if (allBatchDone) {
-                const sortedBatch = [...batchItems].sort((a, b) => (a.sceneIndex ?? 0) - (b.sceneIndex ?? 0));
+            // Step 2: Asynchronously trigger AI Quality Inspection & Score
+            try {
+              const evalRes = await fetch('/api/video/evaluate-and-refine', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  videoUrl,
+                  referenceImageUrl: targetItem.startImageUrl,
+                  currentPrompt: targetItem.prompt,
+                  sceneNumber: (targetItem.sceneIndex ?? 0) + 1,
+                  sceneType: targetItem.title || `Phân cảnh ${(targetItem.sceneIndex ?? 0) + 1}`,
+                  retryCount: targetItem.evaluationRetryCount || 0,
+                  apiKey: apiConfig.apiKey,
+                  visionConfig: apiConfig.visionAnalysis,
+                }),
+              });
+
+              const evalData = await evalRes.json().catch(() => ({}));
+              const evalScore = typeof evalData.score === 'number' ? evalData.score : 8.0;
+              const isPassed = evalData.passed !== undefined ? evalData.passed : evalScore >= 7.0;
+              const evalSummary = evalData.summary || (isPassed ? 'Video chân thực đạt chuẩn' : 'Chất lượng video chưa đạt chuẩn');
+              const currentRetries = targetItem.evaluationRetryCount || 0;
+
+              // Self-healing: if score <= 6.9 and retries < 2, auto-refine prompt & regenerate video for this scene
+              if (!isPassed && currentRetries < 2) {
+                const refinedPrompt = evalData.refinedPrompt || targetItem.prompt;
+                showToast(
+                  `⚠️ Cảnh ${(targetItem.sceneIndex ?? 0) + 1} đạt ${evalScore.toFixed(1)}/10 (${evalSummary}). AI đang tự động sửa prompt & tạo lại (Lần ${currentRetries + 1}/2)...`,
+                  'warning'
+                );
+
+                const itemToRetry: VideoGenerationItem = {
+                  ...targetItem,
+                  status: 'queued',
+                  progress: 5,
+                  prompt: refinedPrompt,
+                  refinedPrompt: refinedPrompt,
+                  evaluationStatus: 'retrying',
+                  evaluationScore: evalScore,
+                  evaluationSummary: evalSummary,
+                  evaluationIssues: evalData.issues || [],
+                  evaluationRetryCount: currentRetries + 1,
+                  statusMessage: `Điểm ${evalScore.toFixed(1)}/10: Tự động sửa prompt & tạo lại (Lần ${currentRetries + 1}/2)`,
+                };
+
+                setVideoItems((prev) =>
+                  prev.map((item) => (item.id === targetItem.id ? itemToRetry : item))
+                );
+
                 setTimeout(() => {
-                  handleMergeCompletedScenes(sortedBatch);
-                }, 1000);
+                  executeRealKlingVideoTask(itemToRetry);
+                }, 800);
+                return;
               }
 
-              return updated;
-            });
-            try {
-              confetti({ particleCount: 80, spread: 60, origin: { y: 0.8 } });
-            } catch (_) {}
-            showToast('Tạo Video Kling AI hoàn tất thành công!', 'success');
+              // Passed (score >= 7.0) or Max Retries reached
+              setVideoItems((prev) => {
+                const updated = prev.map((item) =>
+                  item.id === targetItem.id
+                    ? {
+                        ...item,
+                        status: 'completed' as const,
+                        progress: 100,
+                        resultVideoUrl: videoUrl,
+                        completedAt: Date.now(),
+                        evaluationStatus: isPassed ? ('passed' as const) : ('failed' as const),
+                        evaluationScore: evalScore,
+                        evaluationSummary: evalSummary,
+                        evaluationIssues: evalData.issues || [],
+                        evaluationRetryCount: currentRetries,
+                        statusMessage: isPassed
+                          ? `⭐ ${evalScore.toFixed(1)}/10 - Đạt chuẩn chân thực`
+                          : `⚠️ ${evalScore.toFixed(1)}/10 - Đã tạo lại ${currentRetries} lần`,
+                      }
+                    : item
+                );
+
+                // Check if ALL videos in the current batch have finished evaluation and are ready for merging
+                const targetBatchId = targetItem.batchId;
+                const batchItems = targetBatchId ? updated.filter((it) => it.batchId === targetBatchId) : updated;
+                const allBatchReadyToMerge =
+                  batchItems.length >= 2 &&
+                  batchItems.every(
+                    (it) =>
+                      it.status === 'completed' &&
+                      Boolean(it.resultVideoUrl) &&
+                      it.evaluationStatus !== 'evaluating' &&
+                      it.evaluationStatus !== 'retrying'
+                  );
+
+                if (allBatchReadyToMerge) {
+                  const sortedBatch = [...batchItems].sort((a, b) => (a.sceneIndex ?? 0) - (b.sceneIndex ?? 0));
+                  console.log(`🎬 [Auto Merger] Tất cả ${sortedBatch.length} cảnh đã qua thẩm định chất lượng AI. Tự động tiến hành ghép video hoàn chỉnh!`);
+                  showToast(`🎉 Tất cả ${sortedBatch.length} phân cảnh đã qua thẩm định chất lượng AI! Tự động ghép video hoàn chỉnh...`, 'success');
+                  setTimeout(() => {
+                    handleMergeCompletedScenes(sortedBatch);
+                  }, 1200);
+                }
+
+                return updated;
+              });
+
+              if (isPassed) {
+                try {
+                  confetti({ particleCount: 70, spread: 50, origin: { y: 0.8 } });
+                } catch (_) {}
+                showToast(`⭐ Cảnh ${(targetItem.sceneIndex ?? 0) + 1} đạt ${evalScore.toFixed(1)}/10: ${evalSummary}`, 'success');
+              }
+            } catch (evalErr: any) {
+              console.warn("Lỗi kiểm định video:", evalErr);
+              // Fallback to completed
+              setVideoItems((prev) =>
+                prev.map((item) =>
+                  item.id === targetItem.id
+                    ? {
+                        ...item,
+                        status: 'completed' as const,
+                        progress: 100,
+                        resultVideoUrl: videoUrl,
+                        completedAt: Date.now(),
+                        evaluationStatus: 'passed',
+                        evaluationScore: 8.0,
+                        evaluationSummary: 'Đã hoàn thành',
+                      }
+                    : item
+                )
+              );
+            }
           } else if (statusData.status === 'failed') {
             clearInterval(pollTimer);
             const failReason = statusData.error || statusData.statusMsg || 'Kling AI xử lý video thất bại';

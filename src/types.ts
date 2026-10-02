@@ -39,7 +39,7 @@ export interface VideoGenerationItem {
   cfgScale: number;
   model: string;
   // Execution status
-  status: 'idle' | 'queued' | 'generating' | 'completed' | 'error';
+  status: 'idle' | 'queued' | 'generating' | 'evaluating' | 'completed' | 'error';
   progress: number;
   taskId?: string;
   resultVideoUrl?: string;
@@ -49,6 +49,14 @@ export interface VideoGenerationItem {
   sceneIndex?: number;
   createdAt: number;
   completedAt?: number;
+  // AI Quality Inspection & Auto-Regeneration (Scale 1-10)
+  evaluationStatus?: 'idle' | 'evaluating' | 'passed' | 'failed' | 'retrying';
+  evaluationScore?: number;
+  evaluationSummary?: string;
+  evaluationIssues?: string[];
+  evaluationRetryCount?: number;
+  refinedPrompt?: string;
+  statusMessage?: string;
 }
 
 export type ApiProviderType = 'gemini' | 'kling' | 'gpt-image-2';

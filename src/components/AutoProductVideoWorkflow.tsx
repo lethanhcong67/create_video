@@ -81,8 +81,10 @@ export interface VideoScriptScene {
   imagePrompt: string;
   videoPrompt: string;
   cameraMotion: CameraMovementType;
-  duration: '5' | '10';
+  duration?: string;
   selectedRefImage?: string;
+  selectedImageIndex?: number;
+  refImageReason?: string;
   generatedImageUrl?: string;
   isGeneratingImage?: boolean;
   imageError?: string;
@@ -432,12 +434,23 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
         } catch {}
       }
 
-      // Assign default reference product images to each scene
+      // Assign AI matched reference product images to each scene
       const refPool = productData.selectedImages.length > 0 ? productData.selectedImages : productData.images;
-      const scenesWithRef = (script.scenes || []).map((sc, idx) => ({
-        ...sc,
-        selectedRefImage: sc.selectedRefImage || refPool[idx % refPool.length] || refPool[0],
-      }));
+      const scenesWithRef = (script.scenes || []).map((sc, idx) => {
+        let chosenImg = sc.selectedRefImage;
+        if (!chosenImg) {
+          if (sc.selectedImageIndex !== undefined && refPool[sc.selectedImageIndex]) {
+            chosenImg = refPool[sc.selectedImageIndex];
+          } else {
+            chosenImg = refPool[idx % refPool.length] || refPool[0];
+          }
+        }
+        return {
+          ...sc,
+          selectedRefImage: chosenImg,
+          selectedImageIndex: sc.selectedImageIndex !== undefined ? sc.selectedImageIndex : idx % refPool.length,
+        };
+      });
 
       const finalScript: VideoScriptOutput = {
         ...script,
@@ -507,17 +520,17 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
     forceRegenerate = false,
     maxRetries = 5,
     retryDelayMs = 5000
-  ): Promise<boolean> => {
+  ): Promise<string | null> => {
     const currentScript = customScript || scriptOutputRef.current;
     const currentProduct = customProduct || productDataRef.current;
-    if (!currentScript || !currentProduct) return false;
+    if (!currentScript || !currentProduct) return null;
     const initialScene = currentScript.scenes[index];
-    if (!initialScene) return false;
+    if (!initialScene) return null;
 
     // If image is already generated and not forced, preserve it
     if (initialScene.generatedImageUrl && !forceRegenerate) {
       console.log(`[Cảnh ${initialScene.sceneNumber}] Đã có ảnh phân cảnh, giữ nguyên.`);
-      return true;
+      return initialScene.generatedImageUrl;
     }
 
     const refImage =
@@ -529,7 +542,7 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
         isGeneratingImage: false,
         imageError: 'Vui lòng chọn hoặc có ít nhất 1 ảnh sản phẩm tham chiếu.',
       });
-      return false;
+      return null;
     }
 
     // Try initial attempt + up to maxRetries (total attempts = 1 + 5 = 6)
@@ -585,15 +598,29 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
           throw new Error(resData.error || 'Không thể tạo ảnh phân cảnh');
         }
 
+        const generatedUrl = resData.imageUrl;
+
+        // Synchronously update scriptOutputRef to prevent state race condition
+        if (scriptOutputRef.current && scriptOutputRef.current.scenes[index]) {
+          scriptOutputRef.current.scenes[index] = {
+            ...scriptOutputRef.current.scenes[index],
+            generatedImageUrl: generatedUrl,
+            isGeneratingImage: false,
+            imageError: undefined,
+            retryAttempt: 0,
+            retryStatusText: undefined,
+          };
+        }
+
         // Successfully generated
         handleUpdateScene(index, {
-          generatedImageUrl: resData.imageUrl,
+          generatedImageUrl: generatedUrl,
           isGeneratingImage: false,
           imageError: undefined,
           retryAttempt: 0,
           retryStatusText: undefined,
         });
-        return true;
+        return generatedUrl;
       } catch (err: any) {
         console.warn(
           `❌ [Cảnh ${index + 1}] Lỗi tạo ảnh (Lần thử ${attempt + 1}/${maxRetries + 1}):`,
@@ -606,11 +633,11 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
             retryAttempt: attempt,
             retryStatusText: `Đã thử lại ${maxRetries} lần thất bại. Bạn có thể bấm "Tạo lại" thủ công.`,
           });
-          return false;
+          return null;
         }
       }
     }
-    return false;
+    return null;
   };
 
   // Generate Image for a Single Scene triggered manually by user
@@ -623,18 +650,44 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
     customScript?: VideoScriptOutput,
     customProduct?: ScrapedProductData,
     forceAll = false
-  ) => {
+  ): Promise<VideoScriptOutput | null> => {
     const targetScript = customScript || scriptOutputRef.current;
     const targetProduct = customProduct || productDataRef.current;
-    if (!targetScript || !targetProduct || isGeneratingAllImages) return;
+    if (!targetScript || !targetProduct) return null;
 
     setIsGeneratingAllImages(true);
     try {
-      const tasks = targetScript.scenes.map((_, idx) => () =>
-        generateSingleSceneImageWithRetry(idx, targetScript, targetProduct, forceAll, 5, 5000)
-      );
+      const generatedImageUrls: (string | null)[] = new Array(targetScript.scenes.length).fill(null);
+      const tasks = targetScript.scenes.map((_, idx) => async () => {
+        const url = await generateSingleSceneImageWithRetry(idx, targetScript, targetProduct, forceAll, 5, 5000);
+        generatedImageUrls[idx] = url || targetScript.scenes[idx].generatedImageUrl || null;
+        return url;
+      });
+
       // Run up to 5 concurrent images simultaneously
       await runWithConcurrency(tasks, 5);
+
+      // Construct verified updated script object containing all 5 generated images
+      const updatedScenes = targetScript.scenes.map((sc, idx) => ({
+        ...sc,
+        generatedImageUrl: generatedImageUrls[idx] || sc.generatedImageUrl,
+        isGeneratingImage: false,
+      }));
+
+      const finalUpdatedScript: VideoScriptOutput = {
+        ...targetScript,
+        scenes: updatedScenes,
+      };
+
+      setScriptOutput(finalUpdatedScript);
+      scriptOutputRef.current = finalUpdatedScript;
+      try {
+        sessionStorage.setItem(STORAGE_KEY_SCRIPT, JSON.stringify(finalUpdatedScript));
+      } catch (e) {
+        console.warn("Lỗi lưu sessionStorage:", e);
+      }
+
+      return finalUpdatedScript;
     } finally {
       setIsGeneratingAllImages(false);
     }
@@ -775,10 +828,21 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
       }
 
       const refPool = newProductData.selectedImages.length > 0 ? newProductData.selectedImages : newProductData.images;
-      const scenesWithRef = (script.scenes || []).map((sc, idx) => ({
-        ...sc,
-        selectedRefImage: sc.selectedRefImage || refPool[idx % refPool.length] || refPool[0],
-      }));
+      const scenesWithRef = (script.scenes || []).map((sc, idx) => {
+        let chosenImg = sc.selectedRefImage;
+        if (!chosenImg) {
+          if (sc.selectedImageIndex !== undefined && refPool[sc.selectedImageIndex]) {
+            chosenImg = refPool[sc.selectedImageIndex];
+          } else {
+            chosenImg = refPool[idx % refPool.length] || refPool[0];
+          }
+        }
+        return {
+          ...sc,
+          selectedRefImage: chosenImg,
+          selectedImageIndex: sc.selectedImageIndex !== undefined ? sc.selectedImageIndex : idx % refPool.length,
+        };
+      });
 
       const finalScript: VideoScriptOutput = {
         ...script,
@@ -793,30 +857,35 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
       setAutoCurrentStage('generating_images');
       setAutoStageMessage('Đang tự động tạo đa luồng 5 ảnh song song (Tự động thử lại 5s nếu lỗi)...');
 
-      await handleGenerateAllSceneImagesParallel(finalScript, newProductData, false);
+      const parallelScriptResult = await handleGenerateAllSceneImagesParallel(finalScript, newProductData, false);
 
-      // 5. STAGE: AUTO ENQUEUE ALL 5 SCENES TO KLING AI VIDEO GENERATOR
-      setAutoCurrentStage('enqueueing_videos');
-      setAutoStageMessage('Đang tự động chuyển ảnh và prompt sang Kling AI để render video...');
+      // Helper to generate adaptive video prompt and negative prompt with fast-paced viral UGC pacing, anti-180-degree flip, and character vs zoom-in logic
+      const buildAdaptiveVideoPayload = (scene: VideoScriptScene, targetImage?: string) => {
+        const isCharacterOrHandScene =
+          /hand|hold|touch|finger|person|woman|man|model|unboxing|wearing|putting|cầm|tay|người|vuốt|chạm/i.test(
+            `${scene.videoPrompt} ${scene.visualDescription} ${scene.sceneType} ${scene.title}`
+          );
 
-      const latestScript = scriptOutputRef.current || finalScript;
-      const defaultAntiArtifactNegative =
-        'self-rotating object, autonomous object spinning, floating in air, levitation, phantom movement, object moving without human hands, spontaneous lifting, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, morphing, warping, artificial slow motion, blurry details, distorted logo, distorted text';
+        const basePrompt = scene.videoPrompt.trim();
+        let finalPrompt = "";
+        let finalCameraMotion = scene.cameraMotion || 'static';
 
-      const itemsToEnqueue = latestScript.scenes.map((scene, idx) => {
-        // Enforce exact corresponding reference image for this scene
-        const targetImage =
-          scene.generatedImageUrl ||
-          scene.selectedRefImage ||
-          (newProductData && (newProductData.selectedImages[idx % newProductData.selectedImages.length] || newProductData.images[0])) ||
-          undefined;
+        if (isCharacterOrHandScene) {
+          finalPrompt = `${basePrompt}, lively energetic natural human hands swiftly and deftly interacting with product at authentic 1.0x real-time speed, crisp agile finger movements, radiant warm smile, captivating viral TikTok UGC pacing, dynamic snappy motion throughout full 5s take, subtle tilt max 15-30 degrees catching glossy light glints, strictly no 180-degree flip to backside, front printed artwork and typography continuously face the camera clearly visible at all times, static fixed camera locked on tripod with zero camera drift, strictly no slow motion, no sluggish delay, rigid solid object geometry with zero bending zero warping zero deformation, custom printed artwork and typography remain 100% stable crisp legible and permanently fixed on product surface, natural physics and gravity, single continuous uncut take, no smoke, no glare, 4k ultra realistic`;
+          finalCameraMotion = scene.cameraMotion || 'static';
+        } else {
+          // Standalone product: fast-paced dynamic punchy cinematic push-in zoom-in with rapid visual impact
+          finalPrompt = `${basePrompt}, standalone rigid solid product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing tightly onto the crisp front printed artwork and fine craftsmanship, front graphic and typography always directly facing camera with strictly no 180-degree flip, glossy dynamic ambient light reflection streak gliding swiftly across surface, high visual retention, snappy lively momentum, strictly no slow motion, zero sluggish delay, 1.0x energetic real-time playback speed, rigid indestructible geometry, single uncut take, no smoke, no glare, 4k photorealistic`;
+          finalCameraMotion = scene.cameraMotion && scene.cameraMotion !== 'static' ? scene.cameraMotion : 'zoom_in';
+        }
 
-        const enhancedPrompt = `${scene.videoPrompt}, single continuous one-shot take without cuts, continuous uncut mobile camera recording, zero scene switching, authentic smartphone POV handheld video, shot on mobile phone camera, standard 1.0x real-time speed, realistic physics and gravity, product is completely stationary anchored on surface unless held or moved by real human hands, strictly no self-rotation, no autonomous movement, no floating, strictly no slow motion, 4k photorealistic`;
+        const defaultAntiArtifactNegative =
+          'sluggish, slow motion, slow-mo, slowmo, bullet time, paused motion, frozen frame, snail pace, low energy, boring static shot, dull pacing, lazy movement, lifeless expressions, 180 degree flip, flipping backwards, flipping to backside, spinning to back, showing blank back, turning around 180 degrees, backward flip, reverse flip, rotated to rear view, phantom hands, phantom fingers appearing out of nowhere, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, camera shake, camera panning, camera tilting, camera drift, camera rotating, timelapse, glare, lens flare, harsh reflections, blinding light, blown out highlights, overexposure, hot spots, smoke, steam, fog, haze, mist, vapor, fumes, self-rotating object, autonomous object spinning, floating in air, levitation, deformed product, rubbery product, bending product, soft melting object, morphing graphics, dissolving text, warped print, stretching artwork, fading logo, morphing, warping, blurry details, distorted logo, distorted text, low quality';
 
         return {
-          prompt: enhancedPrompt,
+          prompt: finalPrompt,
           negativePrompt: defaultAntiArtifactNegative,
-          cameraMovement: scene.cameraMotion || 'handheld',
+          cameraMovement: finalCameraMotion,
           duration: scene.duration || '5',
           mode: targetMode,
           aspectRatio: targetRatio,
@@ -824,12 +893,30 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
           model: apiConfig.kling?.model || 'kling-v2-6',
           startImageUrl: targetImage,
         };
+      };
+
+      // 5. STAGE: AUTO ENQUEUE ALL 5 SCENES TO KLING AI VIDEO GENERATOR
+      setAutoCurrentStage('enqueueing_videos');
+      setAutoStageMessage('Đang tự động chuyển đúng ảnh phân cảnh đã tạo và prompt tương ứng sang Kling AI...');
+
+      const latestScript = parallelScriptResult || scriptOutputRef.current || finalScript;
+
+      // Enqueue ALL scenes in the script (all 5 scenes)
+      const itemsToEnqueue = latestScript.scenes.map((scene, idx) => {
+        // Use newly generated image; fallback to selected ref image only if single image failed
+        const targetImage =
+          scene.generatedImageUrl ||
+          scene.selectedRefImage ||
+          (newProductData && (newProductData.selectedImages[idx % newProductData.selectedImages.length] || newProductData.images[0])) ||
+          undefined;
+
+        return buildAdaptiveVideoPayload(scene, targetImage);
       });
 
       onBatchEnqueueVideos(itemsToEnqueue);
 
       setAutoCurrentStage('done');
-      setAutoStageMessage('🎉 Đã tự động tạo xong toàn bộ ảnh & đã gửi 5 video vào hàng đợi Kling AI!');
+      setAutoStageMessage(`🎉 Đã tạo xong ${itemsToEnqueue.length} ảnh phân cảnh & đã gửi đủ ${itemsToEnqueue.length} video vào hàng đợi Kling AI!`);
 
       // Smooth scroll down to generated videos section
       setTimeout(() => {
@@ -848,63 +935,76 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
     }
   };
 
+  // Helper to generate adaptive video payload for a single scene
+  const buildSceneVideoPayload = (scene: VideoScriptScene, targetImage?: string) => {
+    const isCharacterOrHandScene =
+      /hand|hold|touch|finger|person|woman|man|model|unboxing|wearing|putting|cầm|tay|người|vuốt|chạm/i.test(
+        `${scene.videoPrompt} ${scene.visualDescription} ${scene.sceneType} ${scene.title}`
+      );
+
+    const basePrompt = scene.videoPrompt.trim();
+    let finalPrompt = "";
+    let finalCameraMotion = scene.cameraMotion || 'static';
+
+    if (isCharacterOrHandScene) {
+      finalPrompt = `${basePrompt}, lively energetic natural human hands swiftly and deftly interacting with product at authentic 1.0x real-time speed, crisp agile finger movements, radiant warm smile, captivating viral TikTok UGC pacing, dynamic snappy motion throughout full 5s take, subtle tilt max 15-30 degrees catching glossy light glints, strictly no 180-degree flip to backside, front printed artwork and typography continuously face the camera clearly visible at all times, static fixed camera locked on tripod with zero camera drift, strictly no slow motion, no sluggish delay, rigid solid object geometry with zero bending zero warping zero deformation, custom printed artwork and typography remain 100% stable crisp legible and permanently fixed on product surface, natural physics and gravity, single continuous uncut take, no smoke, no glare, 4k ultra realistic`;
+      finalCameraMotion = scene.cameraMotion || 'static';
+    } else {
+      // Standalone product: fast-paced dynamic punchy cinematic push-in zoom-in with rapid visual impact
+      finalPrompt = `${basePrompt}, standalone rigid solid product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing tightly onto the crisp front printed artwork and fine craftsmanship, front graphic and typography always directly facing camera with strictly no 180-degree flip, glossy dynamic ambient light reflection streak gliding swiftly across surface, high visual retention, snappy lively momentum, strictly no slow motion, zero sluggish delay, 1.0x energetic real-time playback speed, rigid indestructible geometry, single uncut take, no smoke, no glare, 4k photorealistic`;
+      finalCameraMotion = scene.cameraMotion && scene.cameraMotion !== 'static' ? scene.cameraMotion : 'zoom_in';
+    }
+
+    const defaultAntiArtifactNegative =
+      'sluggish, slow motion, slow-mo, slowmo, bullet time, paused motion, frozen frame, snail pace, low energy, boring static shot, dull pacing, lazy movement, lifeless expressions, 180 degree flip, flipping backwards, flipping to backside, spinning to back, showing blank back, turning around 180 degrees, backward flip, reverse flip, rotated to rear view, phantom hands, phantom fingers appearing out of nowhere, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, camera shake, camera panning, camera tilting, camera drift, camera rotating, timelapse, glare, lens flare, harsh reflections, blinding light, blown out highlights, overexposure, hot spots, smoke, steam, fog, haze, mist, vapor, fumes, self-rotating object, autonomous object spinning, floating in air, levitation, deformed product, rubbery product, bending product, soft melting object, morphing graphics, dissolving text, warped print, stretching artwork, fading logo, morphing, warping, blurry details, distorted logo, distorted text, low quality';
+
+    return {
+      prompt: finalPrompt,
+      negativePrompt: defaultAntiArtifactNegative,
+      cameraMovement: finalCameraMotion,
+      duration: scene.duration || '5',
+      mode: targetMode,
+      aspectRatio: targetRatio,
+      cfgScale: 0.6,
+      model: apiConfig.kling?.model || 'kling-v2-6',
+      startImageUrl: targetImage,
+    };
+  };
+
   // Enqueue a Single Scene to Create Video
   const handleEnqueueSingleScene = (index: number) => {
     if (!scriptOutput) return;
     const scene = scriptOutput.scenes[index];
     if (!scene) return;
 
-    const startImage =
-      scene.generatedImageUrl ||
-      scene.selectedRefImage ||
-      (productData ? (productData.selectedImages[index % productData.selectedImages.length] || productData.images[0]) : undefined);
+    // STRICT: Require the scene image to be generated first
+    if (!scene.generatedImageUrl) {
+      alert(`⚠️ Cảnh ${scene.sceneNumber || index + 1} chưa được tạo ảnh AI thành công! Vui lòng bấm "Tạo ảnh cảnh này" trước để lấy hình ảnh phân cảnh đã tạo làm tham chiếu tạo video.`);
+      return;
+    }
 
-    const defaultAntiArtifactNegative =
-      'self-rotating object, autonomous object spinning, floating in air, levitation, phantom movement, object moving without human hands, spontaneous lifting, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, morphing, warping, artificial slow motion, blurry details, distorted logo, distorted text';
+    const startImage = scene.generatedImageUrl;
+    const item = buildSceneVideoPayload(scene, startImage);
 
-    const enhancedPrompt = `${scene.videoPrompt}, single continuous one-shot take without cuts, continuous uncut mobile camera recording, zero scene switching, authentic smartphone POV handheld video, shot on mobile phone camera, standard 1.0x real-time speed, realistic physics and gravity, product is completely stationary anchored on surface unless held or moved by real human hands, strictly no self-rotation, no autonomous movement, no floating, strictly no slow motion, 4k photorealistic`;
-
-    onBatchEnqueueVideos([
-      {
-        prompt: enhancedPrompt,
-        negativePrompt: defaultAntiArtifactNegative,
-        cameraMovement: scene.cameraMotion || 'handheld',
-        duration: scene.duration || '5',
-        mode: targetMode,
-        aspectRatio: targetRatio,
-        cfgScale: 0.6,
-        model: apiConfig.kling?.model || 'kling-v2-6',
-        startImageUrl: startImage,
-      },
-    ]);
+    onBatchEnqueueVideos([item]);
   };
 
   // Enqueue all scenes to Create Video Studio
   const handleEnqueueAllScenes = () => {
     if (!scriptOutput) return;
 
-    const defaultAntiArtifactNegative =
-      'self-rotating object, autonomous object spinning, floating in air, levitation, phantom movement, object moving without human hands, spontaneous lifting, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, morphing, warping, artificial slow motion, blurry details, distorted logo, distorted text';
+    // Check if any scenes have missing generated images
+    const ungenerated = scriptOutput.scenes.filter((s) => !s.generatedImageUrl);
+    if (ungenerated.length > 0) {
+      const missingNames = ungenerated.map((s) => `Cảnh ${s.sceneNumber}`).join(', ');
+      alert(`⚠️ Chưa tạo ảnh hoàn tất cho: ${missingNames}. Vui lòng bấm "Tạo Tất Cả Ảnh Song Song" trước để đảm bảo mỗi cảnh dùng đúng hình ảnh đã tạo làm tham chiếu.`);
+      return;
+    }
 
-    const itemsToEnqueue = scriptOutput.scenes.map((scene, index) => {
-      const startImage =
-        scene.generatedImageUrl ||
-        scene.selectedRefImage ||
-        (productData ? (productData.selectedImages[index % productData.selectedImages.length] || productData.images[0]) : undefined);
-
-      const enhancedPrompt = `${scene.videoPrompt}, single continuous one-shot take without cuts, continuous uncut mobile camera recording, zero scene switching, authentic smartphone POV handheld video, shot on mobile phone camera, standard 1.0x real-time speed, realistic physics and gravity, product is completely stationary anchored on surface unless held or moved by real human hands, strictly no self-rotation, no autonomous movement, no floating, strictly no slow motion, 4k photorealistic`;
-
-      return {
-        prompt: enhancedPrompt,
-        negativePrompt: defaultAntiArtifactNegative,
-        cameraMovement: scene.cameraMotion || 'handheld',
-        duration: scene.duration || '5',
-        mode: targetMode,
-        aspectRatio: targetRatio,
-        cfgScale: 0.6,
-        model: apiConfig.kling?.model || 'kling-v2-6',
-        startImageUrl: startImage,
-      };
+    const itemsToEnqueue = scriptOutput.scenes.map((scene) => {
+      // STRICTLY use the newly generated image for this scene
+      const startImage = scene.generatedImageUrl!;
+      return buildSceneVideoPayload(scene, startImage);
     });
 
     onBatchEnqueueVideos(itemsToEnqueue);
@@ -1802,14 +1902,22 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
                     })()}
 
                     {/* Section 1: Choose Reference Product Image */}
-                    <div className="space-y-1.5 bg-slate-900/50 p-2.5 rounded-xl border border-slate-800/60">
+                    <div className="space-y-2 bg-slate-900/60 p-3 rounded-xl border border-slate-800/80">
                       <div className="flex items-center justify-between">
-                        <span className="text-[10px] font-bold text-slate-300 flex items-center gap-1">
-                          <ImageIcon className="w-3 h-3 text-cyan-400" />
-                          Ảnh sản phẩm tham chiếu cho cảnh này:
+                        <span className="text-[11px] font-bold text-cyan-300 flex items-center gap-1.5">
+                          <ImageIcon className="w-3.5 h-3.5 text-cyan-400" />
+                          Ảnh tham chiếu AI chọn cho cảnh này:
                         </span>
-                        <span className="text-[10px] text-slate-500">Nhấp để đổi</span>
+                        <span className="text-[10px] text-slate-400">Bấm ảnh bên dưới để đổi</span>
                       </div>
+
+                      {scene.refImageReason && (
+                        <div className="bg-indigo-950/40 border border-indigo-800/40 px-2.5 py-1.5 rounded-lg text-[10px] text-indigo-200 flex items-center gap-1.5">
+                          <span>🎯</span>
+                          <span className="line-clamp-1">{scene.refImageReason}</span>
+                        </div>
+                      )}
+
                       <div className="flex items-center gap-2 overflow-x-auto pb-1">
                         {(productData?.selectedImages || []).map((imgUrl, imgIdx) => {
                           const isRef = scene.selectedRefImage === imgUrl;
@@ -1817,20 +1925,23 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
                             <button
                               key={imgIdx}
                               type="button"
-                              onClick={() => handleUpdateScene(idx, { selectedRefImage: imgUrl })}
-                              className={`relative w-12 h-12 rounded-lg overflow-hidden shrink-0 border-2 transition-all ${
+                              onClick={() => handleUpdateScene(idx, { selectedRefImage: imgUrl, selectedImageIndex: imgIdx })}
+                              className={`relative w-14 h-14 rounded-lg overflow-hidden shrink-0 border-2 transition-all ${
                                 isRef
-                                  ? 'border-cyan-400 ring-2 ring-cyan-400/30'
-                                  : 'border-slate-800 opacity-60 hover:opacity-90'
+                                  ? 'border-cyan-400 ring-2 ring-cyan-400/30 scale-105 shadow-md'
+                                  : 'border-slate-800 opacity-60 hover:opacity-100'
                               }`}
                             >
                               <img
                                 src={imgUrl}
-                                alt="ref"
+                                alt={`ref-${imgIdx}`}
                                 className="w-full h-full object-cover"
                               />
+                              <div className="absolute bottom-0 inset-x-0 bg-black/60 text-[8px] font-mono text-center text-slate-300 py-0.5">
+                                #{imgIdx + 1}
+                              </div>
                               {isRef && (
-                                <div className="absolute top-0.5 right-0.5 w-3.5 h-3.5 rounded-full bg-cyan-500 text-white flex items-center justify-center text-[8px]">
+                                <div className="absolute top-1 right-1 w-4 h-4 rounded-full bg-cyan-500 text-white flex items-center justify-center text-[9px] font-bold shadow-sm">
                                   ✓
                                 </div>
                               )}

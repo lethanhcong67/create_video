@@ -369,6 +369,18 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                         loop
                       />
                     </div>
+                  ) : item.status === 'evaluating' ? (
+                    <div className="flex flex-col items-center gap-3 p-6 text-center">
+                      <RefreshCw className="w-8 h-8 text-amber-400 animate-spin" />
+                      <div>
+                        <span className="text-xs font-bold text-amber-300">
+                          🔍 AI đang thẩm định chất lượng...
+                        </span>
+                        <p className="text-[10px] text-slate-400 mt-1">
+                          Đánh giá độ chân thực, cấu trúc vật thể & chấm điểm (Thang điểm 10)
+                        </p>
+                      </div>
+                    </div>
                   ) : item.status === 'generating' || item.status === 'queued' ? (
                     <div className="flex flex-col items-center gap-3 p-6 text-center">
                       <RefreshCw className="w-8 h-8 text-cyan-400 animate-spin" />
@@ -377,7 +389,9 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                           {item.status === 'queued' ? 'Đang chờ hàng đợi...' : `Đang render video... (${item.progress}%)`}
                         </span>
                         <p className="text-[10px] text-slate-400 mt-1">
-                          Kling AI đang xử lý khung hình chi tiết
+                          {item.evaluationStatus === 'retrying'
+                            ? `🔄 Đang tự động render lại (Lần ${item.evaluationRetryCount}/2)...`
+                            : 'Kling AI đang xử lý khung hình chi tiết'}
                         </p>
                       </div>
                     </div>
@@ -404,13 +418,53 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                       {item.duration}s | {item.mode?.toUpperCase() || 'PRO'}
                     </span>
                   </div>
+
+                  {item.evaluationScore !== undefined && (
+                    <div className="absolute top-2 right-2 flex items-center">
+                      {item.evaluationScore >= 7.0 ? (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-950/90 text-emerald-300 border border-emerald-500/50 shadow-lg backdrop-blur-md flex items-center gap-1">
+                          <span>⭐</span>
+                          <span>{item.evaluationScore.toFixed(1)}/10</span>
+                          <span className="hidden sm:inline text-[9px] text-emerald-400 font-medium">Đạt chuẩn</span>
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-950/90 text-amber-300 border border-amber-500/50 shadow-lg backdrop-blur-md flex items-center gap-1">
+                          <span>⚠️</span>
+                          <span>{item.evaluationScore.toFixed(1)}/10</span>
+                          <span className="text-[9px] text-amber-400 font-medium">
+                            {item.evaluationStatus === 'retrying' ? 'Đang tạo lại' : 'Chưa đạt'}
+                          </span>
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 <div className="p-4 space-y-3 flex-1 flex flex-col justify-between">
-                  <div>
+                  <div className="space-y-2">
                     <p className="text-xs text-slate-300 line-clamp-2 leading-relaxed font-medium">
                       {item.prompt || 'Không có mô tả'}
                     </p>
+
+                    {item.evaluationSummary && (
+                      <div
+                        className={`p-2 rounded-xl text-[11px] leading-snug border ${
+                          item.evaluationScore && item.evaluationScore >= 7.0
+                            ? 'bg-emerald-950/40 border-emerald-800/50 text-emerald-300'
+                            : 'bg-amber-950/40 border-amber-800/50 text-amber-300'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 font-semibold text-[10px] uppercase tracking-wider mb-0.5">
+                          <span>{item.evaluationScore && item.evaluationScore >= 7.0 ? '✅ AI QC Đạt chuẩn' : '⚠️ AI QC Chẩn đoán'}</span>
+                          {item.evaluationRetryCount && item.evaluationRetryCount > 0 ? (
+                            <span className="text-amber-400 text-[10px] font-normal">
+                              (Lần thử {item.evaluationRetryCount}/2)
+                            </span>
+                          ) : null}
+                        </div>
+                        <p className="line-clamp-2">{item.evaluationSummary}</p>
+                      </div>
+                    )}
                   </div>
 
                   <div className="flex items-center justify-between pt-2 border-t border-slate-800/80">
