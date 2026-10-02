@@ -34,6 +34,12 @@ import {
 } from 'lucide-react';
 import { ApiConfig, CameraMovementType } from '../types';
 import { CAMERA_PRESETS, POD_SCENE_ARCHETYPES } from '../data/presets';
+import {
+  VIDEO_NEGATIVE_PROMPT_BASE,
+  isCharacterOrHandScene,
+  buildCharacterSceneVideoPrompt,
+  buildStandaloneSceneVideoPrompt,
+} from '../shared/videoRules';
 
 interface AutoProductVideoWorkflowProps {
   apiConfig: ApiConfig;
@@ -859,42 +865,6 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
 
       const parallelScriptResult = await handleGenerateAllSceneImagesParallel(finalScript, newProductData, false);
 
-      // Helper to generate adaptive video prompt and negative prompt with fast-paced viral UGC pacing, anti-180-degree flip, and character vs zoom-in logic
-      const buildAdaptiveVideoPayload = (scene: VideoScriptScene, targetImage?: string) => {
-        const isCharacterOrHandScene =
-          /hand|hold|touch|finger|person|woman|man|model|unboxing|wearing|putting|cầm|tay|người|vuốt|chạm/i.test(
-            `${scene.videoPrompt} ${scene.visualDescription} ${scene.sceneType} ${scene.title}`
-          );
-
-        const basePrompt = scene.videoPrompt.trim();
-        let finalPrompt = "";
-        let finalCameraMotion = scene.cameraMotion || 'static';
-
-        if (isCharacterOrHandScene) {
-          finalPrompt = `${basePrompt}, lively energetic natural human hands swiftly and deftly interacting with product at authentic 1.0x real-time speed, crisp agile finger movements, radiant warm smile, captivating viral TikTok UGC pacing, dynamic snappy motion throughout full 5s take, subtle tilt max 15-30 degrees catching glossy light glints, strictly no 180-degree flip to backside, front printed artwork and typography continuously face the camera clearly visible at all times, static fixed camera locked on tripod with zero camera drift, strictly no slow motion, no sluggish delay, rigid solid object geometry with zero bending zero warping zero deformation, custom printed artwork and typography remain 100% stable crisp legible and permanently fixed on product surface, natural physics and gravity, single continuous uncut take, no smoke, no glare, 4k ultra realistic`;
-          finalCameraMotion = scene.cameraMotion || 'static';
-        } else {
-          // Standalone product: fast-paced dynamic punchy cinematic push-in zoom-in with rapid visual impact
-          finalPrompt = `${basePrompt}, standalone rigid solid product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing tightly onto the crisp front printed artwork and fine craftsmanship, front graphic and typography always directly facing camera with strictly no 180-degree flip, glossy dynamic ambient light reflection streak gliding swiftly across surface, high visual retention, snappy lively momentum, strictly no slow motion, zero sluggish delay, 1.0x energetic real-time playback speed, rigid indestructible geometry, single uncut take, no smoke, no glare, 4k photorealistic`;
-          finalCameraMotion = scene.cameraMotion && scene.cameraMotion !== 'static' ? scene.cameraMotion : 'zoom_in';
-        }
-
-        const defaultAntiArtifactNegative =
-          'sluggish, slow motion, slow-mo, slowmo, bullet time, paused motion, frozen frame, snail pace, low energy, boring static shot, dull pacing, lazy movement, lifeless expressions, 180 degree flip, flipping backwards, flipping to backside, spinning to back, showing blank back, turning around 180 degrees, backward flip, reverse flip, rotated to rear view, phantom hands, phantom fingers appearing out of nowhere, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, camera shake, camera panning, camera tilting, camera drift, camera rotating, timelapse, glare, lens flare, harsh reflections, blinding light, blown out highlights, overexposure, hot spots, smoke, steam, fog, haze, mist, vapor, fumes, self-rotating object, autonomous object spinning, floating in air, levitation, deformed product, rubbery product, bending product, soft melting object, morphing graphics, dissolving text, warped print, stretching artwork, fading logo, morphing, warping, blurry details, distorted logo, distorted text, low quality';
-
-        return {
-          prompt: finalPrompt,
-          negativePrompt: defaultAntiArtifactNegative,
-          cameraMovement: finalCameraMotion,
-          duration: scene.duration || '5',
-          mode: targetMode,
-          aspectRatio: targetRatio,
-          cfgScale: 0.6,
-          model: apiConfig.kling?.model || 'kling-v2-6',
-          startImageUrl: targetImage,
-        };
-      };
-
       // 5. STAGE: AUTO ENQUEUE ALL 5 SCENES TO KLING AI VIDEO GENERATOR
       setAutoCurrentStage('enqueueing_videos');
       setAutoStageMessage('Đang tự động chuyển đúng ảnh phân cảnh đã tạo và prompt tương ứng sang Kling AI...');
@@ -910,7 +880,7 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
           (newProductData && (newProductData.selectedImages[idx % newProductData.selectedImages.length] || newProductData.images[0])) ||
           undefined;
 
-        return buildAdaptiveVideoPayload(scene, targetImage);
+        return buildSceneVideoPayload(scene, targetImage);
       });
 
       onBatchEnqueueVideos(itemsToEnqueue);
@@ -935,32 +905,26 @@ export const AutoProductVideoWorkflow: React.FC<AutoProductVideoWorkflowProps> =
     }
   };
 
-  // Helper to generate adaptive video payload for a single scene
+  // Helper to generate adaptive video payload for a single scene (character-interaction vs
+  // standalone-product reinforcement text lives in shared/videoRules.ts — the single source
+  // of truth also used by this same component's other call site and, for the negative
+  // prompt, by the server's Kling defaults).
   const buildSceneVideoPayload = (scene: VideoScriptScene, targetImage?: string) => {
-    const isCharacterOrHandScene =
-      /hand|hold|touch|finger|person|woman|man|model|unboxing|wearing|putting|cầm|tay|người|vuốt|chạm/i.test(
-        `${scene.videoPrompt} ${scene.visualDescription} ${scene.sceneType} ${scene.title}`
-      );
+    const hasCharacter = isCharacterOrHandScene(
+      `${scene.videoPrompt} ${scene.visualDescription} ${scene.sceneType} ${scene.title}`
+    );
 
     const basePrompt = scene.videoPrompt.trim();
-    let finalPrompt = "";
-    let finalCameraMotion = scene.cameraMotion || 'static';
-
-    if (isCharacterOrHandScene) {
-      finalPrompt = `${basePrompt}, lively energetic natural human hands swiftly and deftly interacting with product at authentic 1.0x real-time speed, crisp agile finger movements, radiant warm smile, captivating viral TikTok UGC pacing, dynamic snappy motion throughout full 5s take, subtle tilt max 15-30 degrees catching glossy light glints, strictly no 180-degree flip to backside, front printed artwork and typography continuously face the camera clearly visible at all times, static fixed camera locked on tripod with zero camera drift, strictly no slow motion, no sluggish delay, rigid solid object geometry with zero bending zero warping zero deformation, custom printed artwork and typography remain 100% stable crisp legible and permanently fixed on product surface, natural physics and gravity, single continuous uncut take, no smoke, no glare, 4k ultra realistic`;
-      finalCameraMotion = scene.cameraMotion || 'static';
-    } else {
-      // Standalone product: fast-paced dynamic punchy cinematic push-in zoom-in with rapid visual impact
-      finalPrompt = `${basePrompt}, standalone rigid solid product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing tightly onto the crisp front printed artwork and fine craftsmanship, front graphic and typography always directly facing camera with strictly no 180-degree flip, glossy dynamic ambient light reflection streak gliding swiftly across surface, high visual retention, snappy lively momentum, strictly no slow motion, zero sluggish delay, 1.0x energetic real-time playback speed, rigid indestructible geometry, single uncut take, no smoke, no glare, 4k photorealistic`;
-      finalCameraMotion = scene.cameraMotion && scene.cameraMotion !== 'static' ? scene.cameraMotion : 'zoom_in';
-    }
-
-    const defaultAntiArtifactNegative =
-      'sluggish, slow motion, slow-mo, slowmo, bullet time, paused motion, frozen frame, snail pace, low energy, boring static shot, dull pacing, lazy movement, lifeless expressions, 180 degree flip, flipping backwards, flipping to backside, spinning to back, showing blank back, turning around 180 degrees, backward flip, reverse flip, rotated to rear view, phantom hands, phantom fingers appearing out of nowhere, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, camera shake, camera panning, camera tilting, camera drift, camera rotating, timelapse, glare, lens flare, harsh reflections, blinding light, blown out highlights, overexposure, hot spots, smoke, steam, fog, haze, mist, vapor, fumes, self-rotating object, autonomous object spinning, floating in air, levitation, deformed product, rubbery product, bending product, soft melting object, morphing graphics, dissolving text, warped print, stretching artwork, fading logo, morphing, warping, blurry details, distorted logo, distorted text, low quality';
+    const finalPrompt = hasCharacter
+      ? buildCharacterSceneVideoPrompt(basePrompt)
+      : buildStandaloneSceneVideoPrompt(basePrompt);
+    const finalCameraMotion = hasCharacter
+      ? (scene.cameraMotion || 'static')
+      : (scene.cameraMotion && scene.cameraMotion !== 'static' ? scene.cameraMotion : 'zoom_in');
 
     return {
       prompt: finalPrompt,
-      negativePrompt: defaultAntiArtifactNegative,
+      negativePrompt: VIDEO_NEGATIVE_PROMPT_BASE,
       cameraMovement: finalCameraMotion,
       duration: scene.duration || '5',
       mode: targetMode,

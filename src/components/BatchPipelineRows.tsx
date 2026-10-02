@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   UploadCloud,
   Plus,
@@ -95,6 +95,31 @@ export const BatchPipelineRows: React.FC<BatchPipelineRowsProps> = ({
   const [batchCameraMotion, setBatchCameraMotion] = useState<CameraMovementType>(
     settings.defaultCameraMotion || 'static'
   );
+
+  // Tracks the active Kling status-poll interval per row so it can be cleared when the row
+  // is removed or the component unmounts — previously these intervals ran unbounded (up to
+  // maxPoll ticks) even after a row was deleted or the user navigated away.
+  const klingPollTimersRef = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
+
+  const clearKlingPollTimer = (itemId: string) => {
+    const existing = klingPollTimersRef.current.get(itemId);
+    if (existing) {
+      clearInterval(existing);
+      klingPollTimersRef.current.delete(itemId);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      klingPollTimersRef.current.forEach((timer) => clearInterval(timer));
+      klingPollTimersRef.current.clear();
+    };
+  }, []);
+
+  const handleRemoveItem = (id: string) => {
+    clearKlingPollTimer(id);
+    onRemoveItem(id);
+  };
 
   // Apply selected camera movement and its cinematic prompt to all rows
   const handleApplyCameraMotionToAll = (motionId: CameraMovementType) => {
@@ -409,30 +434,35 @@ export const BatchPipelineRows: React.FC<BatchPipelineRowsProps> = ({
         videoProgress: 25,
       });
 
-      // Poll status every 3.5 seconds
+      // Poll status every 3.5 seconds. Any previous timer for this row is cleared first so a
+      // retry never leaves an orphaned interval running alongside the new one.
+      clearKlingPollTimer(item.id);
       let pollCount = 0;
       const maxPoll = 100;
       const pollTimer = setInterval(async () => {
         pollCount++;
         try {
-          const params = new URLSearchParams();
-          if (apiKey) params.set('apiKey', apiKey);
-          if (accessKey) params.set('accessKey', accessKey);
-          if (secretKey) params.set('secretKey', secretKey);
-          if (baseUrl) params.set('baseUrl', baseUrl);
-
-          const statusRes = await fetch(`/api/kling/task-status/${taskId}?${params.toString()}`);
+          // Credentials travel as headers, not query params, so they don't end up logged in
+          // server access logs or browser history on this GET request.
+          const statusRes = await fetch(`/api/kling/task-status/${taskId}`, {
+            headers: {
+              ...(apiKey ? { 'x-kling-api-key': apiKey } : {}),
+              ...(accessKey ? { 'x-kling-access-key': accessKey } : {}),
+              ...(secretKey ? { 'x-kling-secret-key': secretKey } : {}),
+              ...(baseUrl ? { 'x-kling-base-url': baseUrl } : {}),
+            },
+          });
           const statusData = await statusRes.json();
 
           if (statusData.status === 'succeed') {
-            clearInterval(pollTimer);
+            clearKlingPollTimer(item.id);
             onUpdateItem(item.id, {
               videoUrl: statusData.videoUrl,
               videoStatus: 'completed',
               videoProgress: 100,
             });
           } else if (statusData.status === 'failed') {
-            clearInterval(pollTimer);
+            clearKlingPollTimer(item.id);
             onUpdateItem(item.id, {
               videoStatus: 'error',
               videoError: statusData.error || 'Quá trình tạo video thất bại từ Kling AI',
@@ -446,7 +476,7 @@ export const BatchPipelineRows: React.FC<BatchPipelineRowsProps> = ({
           }
 
           if (pollCount >= maxPoll) {
-            clearInterval(pollTimer);
+            clearKlingPollTimer(item.id);
             onUpdateItem(item.id, {
               videoStatus: 'error',
               videoError: 'Quá thời gian chờ tạo video từ Kling AI. Bạn có thể kiểm tra lại sau.',
@@ -456,6 +486,7 @@ export const BatchPipelineRows: React.FC<BatchPipelineRowsProps> = ({
           console.warn('Lỗi kiểm tra trạng thái video:', pollErr);
         }
       }, 3500);
+      klingPollTimersRef.current.set(item.id, pollTimer);
     } catch (err: any) {
       console.error('Lỗi khi bắt đầu tạo video Kling AI:', err);
       onUpdateItem(item.id, {
@@ -660,7 +691,11 @@ export const BatchPipelineRows: React.FC<BatchPipelineRowsProps> = ({
 
               <button
                 type="button"
-                onClick={onClearAll}
+                onClick={() => {
+                  klingPollTimersRef.current.forEach((timer) => clearInterval(timer));
+                  klingPollTimersRef.current.clear();
+                  onClearAll();
+                }}
                 className="text-xs text-rose-600 hover:text-rose-700 font-medium px-2 py-1.5 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
               >
                 Xóa tất cả
@@ -725,7 +760,7 @@ export const BatchPipelineRows: React.FC<BatchPipelineRowsProps> = ({
               uploadedOutfits={uploadedOutfits}
               isProcessingAll={isProcessingAll}
               onUpdateItem={onUpdateItem}
-              onRemoveItem={onRemoveItem}
+              onRemoveItem={handleRemoveItem}
               onProcessSingleItem={onProcessSingleItem}
               onOpenKlingSettings={onOpenKlingSettings}
               onOpenLightbox={(url, title) => {

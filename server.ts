@@ -2,16 +2,85 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import os from "os";
+import net from "net";
+import dns from "dns";
 import { spawn } from "child_process";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import sharp from "sharp";
 import { GoogleGenAI, Modality } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import {
+  VIDEO_NEGATIVE_PROMPT_BASE,
+  CHARACTER_SCENE_VIDEO_SUFFIX,
+  STANDALONE_SCENE_VIDEO_SUFFIX,
+} from "./src/shared/videoRules";
 
 dotenv.config();
 
 const PORT = 3000;
+
+// Returns true if the given IP address is loopback, private, link-local, or otherwise
+// internal — used to block SSRF via endpoints that fetch user-supplied URLs server-side.
+function isBlockedIp(ip: string): boolean {
+  const v4 = ip.replace(/^::ffff:/i, "");
+  if (net.isIPv4(v4)) {
+    const [a, b] = v4.split(".").map(Number);
+    if (a === 127 || a === 0 || a === 10) return true; // loopback / "this network" / private
+    if (a === 172 && b >= 16 && b <= 31) return true; // private
+    if (a === 192 && b === 168) return true; // private
+    if (a === 169 && b === 254) return true; // link-local incl. cloud metadata (169.254.169.254)
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    return false;
+  }
+  if (net.isIPv6(ip)) {
+    const lower = ip.toLowerCase();
+    if (lower === "::1" || lower === "::") return true; // loopback / unspecified
+    if (lower.startsWith("fe80:")) return true; // link-local
+    if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // unique local
+    return false;
+  }
+  return false;
+}
+
+// Validates that a user-supplied URL is http(s) and does not resolve to an internal/private
+// address before the server fetches it, to prevent SSRF (port-scanning the internal network,
+// reaching cloud metadata endpoints, etc. via any endpoint that proxies a remote URL).
+async function assertSafeExternalUrl(rawUrl: string): Promise<URL> {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("URL không hợp lệ");
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Chỉ cho phép URL với giao thức http hoặc https");
+  }
+
+  const hostname = parsed.hostname;
+  if (/^localhost$/i.test(hostname)) {
+    throw new Error("Không được phép truy cập địa chỉ máy chủ nội bộ (chặn SSRF)");
+  }
+
+  const ipsToCheck: string[] = [];
+  if (net.isIP(hostname)) {
+    ipsToCheck.push(hostname);
+  } else {
+    try {
+      const results = await dns.promises.lookup(hostname, { all: true });
+      ipsToCheck.push(...results.map((r) => r.address));
+    } catch {
+      throw new Error("Không thể phân giải tên miền của URL đã cung cấp");
+    }
+  }
+
+  if (ipsToCheck.length === 0 || ipsToCheck.some(isBlockedIp)) {
+    throw new Error("URL trỏ tới địa chỉ mạng nội bộ/không được phép truy cập (chặn SSRF)");
+  }
+
+  return parsed;
+}
 
 // Helper to normalize Kling AI base endpoint
 function normalizeKlingBaseUrl(inputUrl?: string): string {
@@ -153,9 +222,9 @@ async function startServer() {
 
       let parsedUrl: URL;
       try {
-        parsedUrl = new URL(url.trim());
-      } catch (_) {
-        return res.status(400).json({ success: false, error: "Đường dẫn URL không hợp lệ" });
+        parsedUrl = await assertSafeExternalUrl(url.trim());
+      } catch (safeUrlErr: any) {
+        return res.status(400).json({ success: false, error: safeUrlErr?.message || "Đường dẫn URL không hợp lệ" });
       }
 
       console.log(`\n🔍 [Product Scraper] Đang cào thông tin sản phẩm từ: ${parsedUrl.href}`);
@@ -349,6 +418,9 @@ async function startServer() {
           let fetchUrl = raw;
           if (fetchUrl.startsWith("/")) {
             fetchUrl = `http://localhost:${PORT}${fetchUrl}`;
+          } else {
+            // Only guard externally-supplied URLs (not our own self-referencing localhost ones above).
+            await assertSafeExternalUrl(fetchUrl);
           }
           console.log(`📥 [Image Helper] Tải ảnh #${i + 1}/${valid.length} để AI thẩm định & ghép kịch bản: ${fetchUrl.slice(0, 80)}...`);
           const fRes = await fetch(fetchUrl, {
@@ -518,7 +590,9 @@ async function startServer() {
         return res.status(400).json({ error: "Thiếu Gemini API Key để thực hiện phân tích sản phẩm" });
       }
 
-      const imagePart = await prepareProductImagePart(images);
+      // Analyze from every available product photo (not just one) — shape, dimensions, and
+      // print placement around the object cannot be judged reliably from a single angle.
+      const imageParts = await prepareAllProductImageParts(images, 6);
 
       const prompt = `
 Bạn là một Chuyên Gia Giám Định Sản Phẩm Cao Cấp & Trưởng Phòng Kiểm Soát Chất Lượng POD (Print-on-Demand) / Sản phẩm in ấn theo yêu cầu & Quà tặng cá nhân hóa quốc tế.
@@ -530,7 +604,7 @@ Mục tiêu là để toàn bộ các thông số này sau đó sẽ được đ
 THÔNG TIN SẢN PHẨM:
 - Tên sản phẩm: ${title || "Chưa có tiêu đề"}
 - Mô tả: ${description || "Chưa có mô tả"}
-- Ảnh sản phẩm tham chiếu: ${imagePart ? "[Đã đính kèm ảnh chụp thực tế để kiểm tra trực quan]" : "Dựa trên mô tả và tên"}
+- Ảnh sản phẩm tham chiếu: ${imageParts.length > 0 ? `[Đã đính kèm ${imageParts.length} ảnh chụp thực tế từ nhiều góc độ khác nhau để đối chiếu chéo trước khi kết luận hình dạng, kích thước và vị trí họa tiết in]` : "Dựa trên mô tả và tên"}
 
 YÊU CẦU PHÂN TÍCH TỪNG TRƯỜNG THÔNG TIN:
 1. "productName": Tên và loại sản phẩm chuẩn xác (ví dụ: "Đĩa thủy tinh tròn vát cạnh treo cây thông Noel (Round Glass Ornament)", "Cốc gốm sứ trắng 11oz", "Bình giữ nhiệt Tumbler inox 304 20oz", "Tranh mica đèn LED", v.v.).
@@ -561,7 +635,7 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng định d�
 }
 `;
 
-      const responseText = await callGeminiVisionText(apiKey, prompt, imagePart, visionConfig, model);
+      const responseText = await callGeminiVisionText(apiKey, prompt, imageParts, visionConfig, model);
       let jsonString = responseText.replace(/```json/gi, "").replace(/```/g, "").trim();
 
       let parsedData;
@@ -676,7 +750,12 @@ QUY TẮC BẮT BUỘC VỀ NHỊP ĐIỆU & ĐỘ BẢO TOÀN SẢN PHẨM:
 
       // Shared JSON output structure (identical across both prompt branches below) so future
       // rule changes (e.g. anti-180-flip wording) only need to be edited in one place.
-      const sceneJsonStructureTemplate = (productNamePlaceholder: string) => `  "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm",
+      // The example imagePrompt/videoPrompt below deliberately mirrors the exact clause-by-clause
+      // format demanded in the "YÊU CẦU CHO TỪNG CÂU LỆNH" instructions further down (including
+      // the material/shape/dimensions placeholders) — a model tends to pattern-match a concrete
+      // JSON example over prose instructions, so a shorter/divergent example here would silently
+      // undercut those instructions and drop the physical-spec embedding the whole pipeline relies on.
+      const sceneJsonStructureTemplate = (p: { productName: string; material: string; shape: string; dimensions: string }) => `  "productSummary": "Tóm tắt điểm đặc sắc nhất của sản phẩm",
   "adConcept": "Ý tưởng kịch bản thị giác viral nhịp nhanh, cuốn hút cho sản phẩm này",
   "scriptTitle": "Tiêu đề video quảng cáo viral",
   "scenes": [
@@ -688,8 +767,8 @@ QUY TẮC BẮT BUỘC VỀ NHỊP ĐIỆU & ĐỘ BẢO TOÀN SẢN PHẨM:
       "title": "Cảnh 1: Tiêu đề mô tả cảnh phù hợp với sản phẩm",
       "visualDescription": "Mô tả khung hình thị giác dọc 9:16 chân thực...",
       "productFocus": "Đặc tả chi tiết sản phẩm trong cảnh này...",
-      "imagePrompt": "Vertical 9:16 authentic iPhone snapshot photograph of ${productNamePlaceholder}, soft diffused warm indoor lamp light, no smoke no steam, no glare no lens flare, shot on iPhone 15 Pro, raw unedited photo, natural skin pores, no plastic sheen, no waxy AI look, crisp legible typography from reference image, photorealistic 8k",
-      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of ${productNamePlaceholder}, standalone product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing onto front printed artwork, front graphic directly facing camera with strictly no 180-degree flip, snappy lively momentum, normal 1.0x speed, rigid solid geometry, 100% stable printed artwork, 4k",
+      "imagePrompt": "Vertical 9:16 photograph of ${p.productName}, [bối cảnh cụ thể của cảnh này], [tương tác dứt khoát cụ thể của cảnh này], crafted from ${p.material}, precise shape ${p.shape}, realistic scale ${p.dimensions}, 100% identical printed artwork and crisp legible typography from reference image",
+      "videoPrompt": "Vertical 9:16 single continuous one-shot UGC video of ${p.productName}, standalone rigid solid product firmly resting in place with zero phantom hands, dynamic punchy cinematic push-in zoom-in with rapid visual impact focusing tightly onto the crisp front printed artwork and fine craftsmanship, front graphic and typography always directly facing camera with strictly no 180-degree flip, glossy dynamic ambient light reflection streak gliding swiftly across surface, high visual retention, snappy lively momentum, strictly no slow motion, zero sluggish delay, 1.0x energetic real-time playback speed, rigid indestructible geometry, single uncut take, no smoke, no glare, 4k photorealistic",
       "cameraMotion": "zoom_in",
       "duration": "5"
     }
@@ -718,8 +797,9 @@ THÔNG SỐ VẬT LÝ VÀ ĐẶC TÍNH SẢN PHẨM ĐÃ ĐƯỢC GIÁM ĐỊNH 
 YÊU CẦU DỰNG KỊCH BẢN & CHỌN ẢNH THAM CHIẾU:
 Hãy tự động phân tích sản phẩm "${productSpecs.productName}" cùng toàn bộ ${imageParts.length} ảnh tham chiếu gửi kèm, thiết kế ĐÚNG 5 PHÂN CẢNH (EXACTLY 5 SCENES: sceneNumber từ 1 đến 5) theo cấu trúc 5 bước quảng cáo UGC nhịp nhanh, bắt mắt ở trên, và CHỌN ĐÚNG ẢNH THAM CHIẾU TỐI ƯU NHẤT CHO TỪNG CẢNH.
 
-YÊU CẦU CHO TỪNG CÂU LỆNH "imagePrompt" (BẰNG TIẾNG ANH - TONE IPHONE CHÂN THẬT, ÁNH SÁNG ĐẸP BẮT MẮT, KHÔNG KHÓI, KHÔNG CHÓI LÓA):
-- Format: "Vertical 9:16 authentic iPhone snapshot photograph of [${productSpecs.productName}], [Bối cảnh cụ thể cho phân cảnh này], [Tương tác dứt khoát cụ thể của phân cảnh này], soft diffused warm indoor ambient lamp lighting, gentle natural highlights without glare, crystal-clear air with absolutely no smoke no steam no fog, absolutely no lens flare no blinding glare no blown-out overexposure, shot on iPhone 15 Pro camera, 24mm lens, raw unedited mobile photo, genuine human skin texture with natural skin tone, absolutely no plastic sheen, no waxy AI look, no 3D CGI render, crafted from [${productSpecs.material}], precise shape [${productSpecs.shape}], realistic scale [${productSpecs.dimensions}], 100% identical printed artwork and crisp legible typography from reference image, authentic ambient soft shadows, photorealistic 8k."
+YÊU CẦU CHO TỪNG CÂU LỆNH "imagePrompt" (BẰNG TIẾNG ANH - CHỈ TẬP TRUNG MÔ TẢ BỐI CẢNH/TƯƠNG TÁC RIÊNG CỦA TỪNG CẢNH VÀ ĐẶC TÍNH VẬT LÝ SẢN PHẨM):
+- LƯU Ý: Tông chân thực iPhone, ánh sáng dịu, không khói, không chói lóa đã được hệ thống tự động áp dụng CHUNG cho mọi cảnh ở bước tạo ảnh sau này — KHÔNG cần lặp lại các cụm từ đó trong "imagePrompt", chỉ cần tập trung vào nội dung RIÊNG của từng cảnh.
+- Format: "Vertical 9:16 photograph of [${productSpecs.productName}], [Bối cảnh cụ thể cho phân cảnh này], [Tương tác dứt khoát cụ thể của phân cảnh này], crafted from [${productSpecs.material}], precise shape [${productSpecs.shape}], realistic scale [${productSpecs.dimensions}], 100% identical printed artwork and crisp legible typography from reference image."
 
 YÊU CẦU CHO TỪNG CÂU LỆNH "videoPrompt" (BẰNG TIẾNG ANH - NHANH, BẮT MẮT, VIRAL UGC PACING, KHÔNG LẬT 180 ĐỘ, MẶT IN LUÔN HƯỚNG CAMERA, TAY NGƯỜI HOẠT BÁT HOẶC ZOOM-IN DỨT KHOÁT, 1.0X SPEED, RẮN CHẮC BẢO TOÀN THIẾT KẾ, ONESHOT):
 - Nếu cảnh CÓ tay người/nhân vật: "Vertical 9:16 single continuous one-shot UGC video of [${productSpecs.productName}], lively energetic natural human hands swiftly and deftly interacting with product at authentic 1.0x real-time speed, crisp agile finger movements, radiant warm smile, captivating viral TikTok UGC pacing, dynamic snappy motion throughout full 5s take, subtle tilt max 15-30 degrees catching glossy light glints, strictly no 180-degree flip to backside, front printed artwork and typography continuously face the camera clearly visible at all times, static fixed camera locked on tripod, strictly no slow motion, no sluggish delay, rigid solid object geometry with zero bending zero warping zero deformation, custom printed artwork and typography remain 100% stable crisp legible and permanently fixed on product surface, natural physics and gravity, single continuous uncut take, no smoke, no glare, 4k ultra realistic."
@@ -738,7 +818,12 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
     "keyFeatures": "${productSpecs.keyFeatures || ""}",
     "promptSnippet": "${productSpecs.promptSnippet || ""}"
   },
-${sceneJsonStructureTemplate(`[${productSpecs.productName}]`)}
+${sceneJsonStructureTemplate({
+  productName: `[${productSpecs.productName}]`,
+  material: `[${productSpecs.material}]`,
+  shape: `[${productSpecs.shape}]`,
+  dimensions: `[${productSpecs.dimensions}]`,
+})}
 `;
       } else {
         prompt = `
@@ -770,7 +855,12 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo đúng cấu trúc
     "keyFeatures": "Điểm nhấn nổi bật",
     "promptSnippet": "English physical specs snippet"
   },
-${sceneJsonStructureTemplate("...")}
+${sceneJsonStructureTemplate({
+  productName: "...",
+  material: "[chất liệu bạn vừa phân tích được]",
+  shape: "[hình dạng hình học bạn vừa phân tích được]",
+  dimensions: "[kích thước & tỷ lệ bạn vừa phân tích được]",
+})}
 `;
       }
 
@@ -846,6 +936,22 @@ ${sceneJsonStructureTemplate("...")}
     return res.send(item.buffer);
   });
 
+  // Single canonical copy of the product-fidelity/iPhone-realism directive used by every
+  // scene-image generation path (OpenLux/GPT-Image-2 and native Gemini) — previously this
+  // exact block was hand-duplicated in both branches, so any wording tweak had to be made twice.
+  function buildStrictFidelityDirective(sceneInstruction: string): string {
+    return `[CRITICAL PRODUCT REPRODUCTION & IPHONE SNAPSHOT REALISM DIRECTIVE]:
+You MUST reproduce the product EXACTLY as shown in the provided reference image with authentic iPhone camera snapshot realism.
+1. IPHONE REALISM & NATURAL TONES: Shot on iPhone 15 Pro mobile camera (24mm/48mm lens), candid smartphone photography style, raw unedited mobile photo, natural diffused daylight, true-to-life organic colors and accurate white balance. ABSOLUTELY NO plastic sheen, NO waxy AI skin, NO 3D CGI render, NO oversaturated digital artwork.
+2. HUMAN ANATOMY & SKIN: Human hands and skin must be completely photorealistic with visible natural microscopic skin pores, subtle skin texture, natural authentic skin tone, and anatomically correct 5 fingers (ABSOLUTELY NO deformed fingers or plastic smoothing).
+3. PRINTED ARTWORK & TYPOGRAPHY: Every single graphic element, printed illustration, typography, letters, font style, and colors must match the reference product 100%. The printed design must be in tack-sharp focus, pristine, 100% legible, and distortion-free.
+4. GEOMETRY & MATERIALS: Maintain the identical physical shape, profile, and proportions of the product from the reference image (disc stays flat disc, mug stays cylinder, etc.). Authentic real-world physical material behavior (ceramic glaze, glass transparency, metal sheen, fabric weave).
+5. GROUNDED REALISM: The product must be firmly and naturally held in hand with real grip gravity or resting securely on a table/box surface with realistic contact shadows (ZERO floating in mid-air).
+6. SOFT BALANCED LIGHTING, ZERO GLARE & ZERO SMOKE: Soft diffused warm ambient and indoor lamp lighting with gentle, even illumination and subtle natural highlights on the product surface. Crystal-clear atmosphere with ABSOLUTELY NO smoke, NO steam, NO fog, NO haze, NO mist, NO vapor. ABSOLUTELY NO glare, NO lens flare, NO harsh blinding reflections, NO blown-out overexposed hot spots.
+
+Specific scene layout and action: ${sceneInstruction}`;
+  }
+
   // Dedicated Scene Image Generator from Product Reference Image
   app.post("/api/scene/generate-image", async (req, res) => {
     try {
@@ -873,6 +979,7 @@ ${sceneJsonStructureTemplate("...")}
       let base64Data = "";
       let mimeType = "image/jpeg";
       if (typeof rawRef === "string" && (rawRef.startsWith("http://") || rawRef.startsWith("https://"))) {
+        await assertSafeExternalUrl(rawRef);
         console.log(`📥 [Scene Image Gen] Đang tải ảnh tham chiếu từ URL: ${rawRef.slice(0, 100)}...`);
         const fetchRes = await fetch(rawRef, {
           headers: {
@@ -925,16 +1032,7 @@ ${sceneJsonStructureTemplate("...")}
           pngBuf = rawBuf;
         }
 
-        const strictFidelityDirective = `[CRITICAL PRODUCT REPRODUCTION & IPHONE SNAPSHOT REALISM DIRECTIVE]:
-You MUST reproduce the product EXACTLY as shown in the provided reference image with authentic iPhone camera snapshot realism.
-1. IPHONE REALISM & NATURAL TONES: Shot on iPhone 15 Pro mobile camera (24mm/48mm lens), candid smartphone photography style, raw unedited mobile photo, natural diffused daylight, true-to-life organic colors and accurate white balance. ABSOLUTELY NO plastic sheen, NO waxy AI skin, NO 3D CGI render, NO oversaturated digital artwork.
-2. HUMAN ANATOMY & SKIN: Human hands and skin must be completely photorealistic with visible natural microscopic skin pores, subtle skin texture, natural authentic skin tone, and anatomically correct 5 fingers (ABSOLUTELY NO deformed fingers or plastic smoothing).
-3. PRINTED ARTWORK & TYPOGRAPHY: Every single graphic element, printed illustration, typography, letters, font style, and colors must match the reference product 100%. The printed design must be in tack-sharp focus, pristine, 100% legible, and distortion-free.
-4. GEOMETRY & MATERIALS: Maintain the identical physical shape, profile, and proportions of the product from the reference image (disc stays flat disc, mug stays cylinder, etc.). Authentic real-world physical material behavior (ceramic glaze, glass transparency, metal sheen, fabric weave).
-5. GROUNDED REALISM: The product must be firmly and naturally held in hand with real grip gravity or resting securely on a table/box surface with realistic contact shadows (ZERO floating in mid-air).
-6. SOFT BALANCED LIGHTING, ZERO GLARE & ZERO SMOKE: Soft diffused warm ambient and indoor lamp lighting with gentle, even illumination and subtle natural highlights on the product surface. Crystal-clear atmosphere with ABSOLUTELY NO smoke, NO steam, NO fog, NO haze, NO mist, NO vapor. ABSOLUTELY NO glare, NO lens flare, NO harsh blinding reflections, NO blown-out overexposed hot spots.
-
-Specific scene layout and action: ${prompt}`;
+        const strictFidelityDirective = buildStrictFidelityDirective(prompt);
 
         const formData = new FormData();
         formData.append("image", new Blob([new Uint8Array(pngBuf)], { type: "image/png" }), "reference_product.png");
@@ -985,16 +1083,7 @@ Specific scene layout and action: ${prompt}`;
         });
 
         const targetModel = "gemini-3.1-flash-image";
-        const strictFidelityDirective = `[CRITICAL PRODUCT REPRODUCTION & IPHONE SNAPSHOT REALISM DIRECTIVE]:
-You MUST reproduce the product EXACTLY as shown in the provided reference image with authentic iPhone camera snapshot realism.
-1. IPHONE REALISM & NATURAL TONES: Shot on iPhone 15 Pro mobile camera (24mm/48mm lens), candid smartphone photography style, raw unedited mobile photo, natural diffused daylight, true-to-life organic colors and accurate white balance. ABSOLUTELY NO plastic sheen, NO waxy AI skin, NO 3D CGI render, NO oversaturated digital artwork.
-2. HUMAN ANATOMY & SKIN: Human hands and skin must be completely photorealistic with visible natural microscopic skin pores, subtle skin texture, natural authentic skin tone, and anatomically correct 5 fingers (ABSOLUTELY NO deformed fingers or plastic smoothing).
-3. PRINTED ARTWORK & TYPOGRAPHY: Every single graphic element, printed illustration, typography, letters, font style, and colors must match the reference product 100%. The printed design must be in tack-sharp focus, pristine, 100% legible, and distortion-free.
-4. GEOMETRY & MATERIALS: Maintain the identical physical shape, profile, and proportions of the product from the reference image (disc stays flat disc, mug stays cylinder, etc.). Authentic real-world physical material behavior (ceramic glaze, glass transparency, metal sheen, fabric weave).
-5. GROUNDED REALISM: The product must be firmly and naturally held in hand with real grip gravity or resting securely on a table/box surface with realistic contact shadows (ZERO floating in mid-air).
-6. SOFT BALANCED LIGHTING, ZERO GLARE & ZERO SMOKE: Soft diffused warm ambient and indoor lamp lighting with gentle, even illumination and subtle natural highlights on the product surface. Crystal-clear atmosphere with ABSOLUTELY NO smoke, NO steam, NO fog, NO haze, NO mist, NO vapor. ABSOLUTELY NO glare, NO lens flare, NO harsh blinding reflections, NO blown-out overexposed hot spots.
-
-Specific scene layout and action: ${prompt}`;
+        const strictFidelityDirective = buildStrictFidelityDirective(prompt);
 
         const response = await client.models.generateContent({
           model: targetModel,
@@ -1850,13 +1939,14 @@ IMPORTANT RULES:
         }
       }
 
-      const baseAntiArtifactNegative =
-        "camera movement, camera shake, camera panning, camera tilting, camera drift, camera zoom, camera rotating, slow motion, slow-mo, slowmo, sluggish motion, bullet time, paused motion, frozen frame, timelapse, glare, lens flare, harsh reflections, blinding light, blown out highlights, overexposure, hot spots, smoke, steam, fog, haze, mist, vapor, fumes, self-rotating object, autonomous object spinning, floating in air, levitation, phantom movement, object moving without human hands, spontaneous lifting, deformed product, rubbery product, bending product, soft melting object, morphing graphics, dissolving text, warped print, stretching artwork, fading logo, deformed fingers, extra fingers, mutated hands, robotic unnatural movement, morphing, warping, blurry details, distorted logo, distorted text, low quality";
+      // Shared with the client's buildSceneVideoPayload (src/shared/videoRules.ts) so the
+      // server-side default and the client-side default never drift apart.
+      const baseAntiArtifactNegative = VIDEO_NEGATIVE_PROMPT_BASE;
 
       const finalNegativePrompt =
-        negative_prompt && typeof negative_prompt === "string" && !negative_prompt.includes("camera movement") && negative_prompt.trim().length > 0
+        negative_prompt && typeof negative_prompt === "string" && negative_prompt.trim().length > 0 && !negative_prompt.includes(baseAntiArtifactNegative)
           ? `${negative_prompt.trim()}, ${baseAntiArtifactNegative}`
-          : baseAntiArtifactNegative;
+          : (negative_prompt && typeof negative_prompt === "string" ? negative_prompt.trim() : baseAntiArtifactNegative);
 
       const defaultPrompt =
         "Vertical 9:16 authentic smartphone UGC commercial video. The model interacts naturally with standard 1.0x real-time speed, keeping the product design, prints, and structure completely fixed and unchanged. Shot on mobile phone camera, natural physics and gravity, 4k photorealistic.";
@@ -1974,12 +2064,13 @@ IMPORTANT RULES:
   app.get("/api/kling/task-status/:taskId", async (req, res) => {
     try {
       const { taskId } = req.params;
-      const {
-        apiKey,
-        accessKey,
-        secretKey,
-        baseUrl = "https://api.openlux.ai/kling",
-      } = req.query as Record<string, string>;
+      // Prefer headers over query params so credentials don't end up in server access logs
+      // or browser history; query params are still accepted for backward compatibility.
+      const q = req.query as Record<string, string>;
+      const apiKey = (req.headers["x-kling-api-key"] as string) || q.apiKey;
+      const accessKey = (req.headers["x-kling-access-key"] as string) || q.accessKey;
+      const secretKey = (req.headers["x-kling-secret-key"] as string) || q.secretKey;
+      const baseUrl = (req.headers["x-kling-base-url"] as string) || q.baseUrl || "https://api.openlux.ai/kling";
 
       if (!taskId) {
         return res.status(400).json({ error: "Thiếu taskId" });
@@ -2045,13 +2136,14 @@ IMPORTANT RULES:
   // In-memory / file cache for merged videos
   const mergedVideosCache = new Map<string, { filePath: string; createdAt: number; mimeType: string; duration?: number }>();
 
-  // Periodically clean up merged video files older than 12 hours
+  // Periodically clean up merged video files (and their parent temp dirs) older than 12 hours
   setInterval(() => {
     const cutoff = Date.now() - 12 * 60 * 60 * 1000;
     for (const [id, item] of mergedVideosCache.entries()) {
       if (item.createdAt < cutoff) {
         try {
-          if (fs.existsSync(item.filePath)) fs.unlinkSync(item.filePath);
+          const parentDir = path.dirname(item.filePath);
+          if (fs.existsSync(parentDir)) fs.rmSync(parentDir, { recursive: true, force: true });
         } catch (_) {}
         mergedVideosCache.delete(id);
       }
@@ -2274,7 +2366,11 @@ Hãy trả về DUY NHẤT một mảng JSON gồm chính xác ${count} phần t
               "-i", localVideoPath,
               "-vframes", "1",
               "-q:v", "3",
-              "-s", "512x512",
+              // Cap the longest side at 768px but keep the source aspect ratio (9:16, 16:9, 1:1...)
+              // intact — forcing a fixed 512x512 square here used to squash/stretch every frame
+              // before the QC-gate vision model saw it, which could cause it to misjudge genuine
+              // product-deformation issues against an already geometrically distorted sample.
+              "-vf", "scale='min(768,iw)':'min(768,ih)':force_original_aspect_ratio=decrease",
               framePath,
             ],
             { windowsHide: true }
@@ -2476,10 +2572,8 @@ QUY TẮC PHÂN LOẠI & TỰ ĐỘNG TỐI ƯU PROMPT:
 HƯỚNG DẪN VIẾT "refinedPrompt" KHI ĐIỂM <= 6.9:
 - Câu lệnh tiếng Anh chuẩn xác cho Kling AI.
 - Giữ nguyên bối cảnh và mục đích của Cảnh ${sceneNumber}.
-- Nếu bị lỗi lật 180 độ ra sau: Bắt buộc thêm "strictly no 180-degree flip to backside, front printed artwork and typography continuously face the camera clearly visible at all times, no reverse spinning".
-- Nếu cảnh có người/tay: Thêm "lifelike natural human hands gently holding and subtly adjusting product with slight tilt max 15-30 degrees under soft lamp light, authentic 1.0x human speed, strictly no slow motion, rigid solid object geometry".
-- Nếu cảnh không có người: Thêm "standalone rigid solid product firmly resting in place with zero phantom hands, smooth subtle cinematic slow zoom-in push-in focusing onto front printed artwork, front graphic always directly facing camera with strictly no 180-degree flip, normal 1.0x speed, no slow motion".
-- Luôn giữ: "rigid solid indestructible object geometry with zero bending zero warping zero deformation, custom printed artwork and typography remain 100% stable crisp legible, single continuous uncut take, no smoke, no glare, 4k ultra realistic".
+- Nếu cảnh có người/tay: Bắt buộc thêm cụm chuẩn sau (dùng đúng nguyên văn, đây là cụm đã được kiểm chứng và dùng thống nhất trong toàn hệ thống): "${CHARACTER_SCENE_VIDEO_SUFFIX}".
+- Nếu cảnh không có người: Bắt buộc thêm cụm chuẩn sau (dùng đúng nguyên văn): "${STANDALONE_SCENE_VIDEO_SUFFIX}".
 
 Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo định dạng:
 {
@@ -2551,6 +2645,7 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo định dạng:
 
   // Endpoint to merge multiple scene video URLs into 1 complete video using FFmpeg & AI Smart Transitions
   app.post("/api/video/merge-scenes", async (req, res) => {
+    let mergeTempDir: string | null = null;
     try {
       const {
         videoUrls,
@@ -2575,6 +2670,7 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo định dạng:
 
       const tempDir = path.join(os.tmpdir(), `merge_video_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
       fs.mkdirSync(tempDir, { recursive: true });
+      mergeTempDir = tempDir;
 
       // Step 1: Download or copy each video clip
       const downloadedFiles: string[] = [];
@@ -2751,6 +2847,14 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo định dạng:
         });
       });
 
+      // Intermediate source clips are no longer needed once the merge succeeds —
+      // only outputPath must survive (served later by /api/video/merged/:id).
+      for (const clipFile of downloadedFiles) {
+        try {
+          if (clipFile !== outputPath) fs.unlinkSync(clipFile);
+        } catch (_) {}
+      }
+
       const mergedId = `merged_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       mergedVideosCache.set(mergedId, {
         filePath: outputPath,
@@ -2771,6 +2875,11 @@ Hãy trả về DUY NHẤT một chuỗi JSON hợp lệ theo định dạng:
       });
     } catch (err: any) {
       console.error("❌ [FFmpeg Video Merge Error]:", err);
+      if (mergeTempDir) {
+        try {
+          fs.rmSync(mergeTempDir, { recursive: true, force: true });
+        } catch (_) {}
+      }
       return res.status(500).json({
         error: err?.message || "Lỗi khi ghép video bằng FFmpeg",
       });
@@ -2937,6 +3046,7 @@ Keep your output concise, precise, and directly actionable for an inpainting mod
         const res = await ai.models.generateContent({
           model: "gemini-3.8-flash",
           contents: { parts },
+          config: { abortSignal: controller.signal },
         });
         clearTimeout(timeout);
 
@@ -3150,6 +3260,7 @@ ${outfitPrompt ? `User notes: "${outfitPrompt}"` : ""}`,
         if (!str) return "";
         if (str.startsWith("http://") || str.startsWith("https://")) {
           try {
+            await assertSafeExternalUrl(str);
             const resp = await fetch(str);
             if (resp.ok) {
               const arrayBuf = await resp.arrayBuffer();
@@ -4072,6 +4183,12 @@ CRITICAL TASK: Locate the corresponding product, item, prop, or worn garment in 
 
       if (!rawUrl) {
         return res.status(400).json({ error: "Thiếu tham số URL tệp tải về" });
+      }
+
+      try {
+        await assertSafeExternalUrl(rawUrl);
+      } catch (safeUrlErr: any) {
+        return res.status(400).json({ error: safeUrlErr?.message || "URL tải về không hợp lệ" });
       }
 
       // Try multiple URL formats for cloud CDNs (Tencent COS / AWS S3)
